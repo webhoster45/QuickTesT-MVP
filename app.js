@@ -19,9 +19,7 @@ app.use(express.json());
 ========================================== */
 
 const PORT = 5000;
-const JWT_SECRET = "super_secret_key_change_this";
-const ADMIN_SECRET = "Gbemisolaismymum";
-const MONGO_URI = "mongodb://127.0.0.1:27017/quicktest";
+
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log("MongoDB Connected"))
