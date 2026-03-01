@@ -2,6 +2,8 @@
 // QuickTest Backend - Structured MVP v3
 // Admin Secret + Quiz History + PDF Workflow
 // ==========================================
+require('dotenv').config();
+require('dns').setServers(['8.8.8.8', '1.1.1.1']);
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -10,18 +12,22 @@ const jwt = require("jsonwebtoken");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
+const JWT_SECRET = process.env.JWT_SECRET;
+const ADMIN_SECRET = process.env.ADMIN_SECRET;
+const cors=require("cors");
 
 const app = express();
 app.use(express.json());
+app.use(cors('*'))
 
 /* ==========================================
    CONFIG
 ========================================== */
 
-const PORT = 5000;
+const PORT =process.env.PORT|| 5000;
 
 
-mongoose.connect(MONGO_URI)
+mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB Connected"))
   .catch(err => console.error("MongoDB Error:", err));
 
@@ -146,9 +152,15 @@ app.post("/api/register", async (req, res) => {
         : "User registered successfully"
     });
 
-  } catch {
-    res.status(400).json({ message: "User already exists" });
+  } catch (err) {
+  console.log("REGISTER ERROR:", err);
+
+  if (err.code === 11000) {
+    return res.status(400).json({ message: "Username already taken" });
   }
+
+  res.status(500).json({ message: "Server error" });
+}
 });
 
 /* ==========================================
@@ -178,13 +190,25 @@ app.post("/api/login", async (req, res) => {
 
 app.post("/api/import", authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const filePath = path.join(__dirname, "questions.json");
-    const data = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    const fileName = req.body?.fileName || "questionsmvp.json";
+    const filePath = path.join(__dirname, fileName);
+
+    const rawData = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+
+    let allQuestions = [];
+
+    if (Array.isArray(rawData)) {
+      allQuestions = rawData;
+    } else {
+      for (let key in rawData) {
+        allQuestions = allQuestions.concat(rawData[key]);
+      }
+    }
 
     let inserted = 0;
     let skipped = 0;
 
-    for (let q of data) {
+    for (let q of allQuestions) {
       try {
         await Question.create(q);
         inserted++;
@@ -194,17 +218,26 @@ app.post("/api/import", authMiddleware, adminMiddleware, async (req, res) => {
     }
 
     res.json({ inserted, skipped });
-  } catch {
-    res.status(500).json({ message: "Import failed" });
+
+  } catch (err) {
+    console.log("IMPORT ERROR:", err);
+    res.status(500).json({
+      message: "Import failed",
+      error: err.message
+    });
   }
 });
-
 /* ==========================================
    GET RANDOM QUESTIONS
 ========================================== */
 
 app.get("/api/questions", authMiddleware, async (req, res) => {
-  const { course, topic, difficulty, limit} = req.query;
+  let { course, topic, difficulty, limit } = req.query;
+
+  limit = parseInt(limit) || 10;
+
+  // Prevent abuse
+  if (limit > 50) limit = 50;
 
   const filter = {};
   if (course) filter.course = course;
@@ -213,7 +246,7 @@ app.get("/api/questions", authMiddleware, async (req, res) => {
 
   const questions = await Question.aggregate([
     { $match: filter },
-    { $sample: { size: parseInt(limit) } },
+    { $sample: { size: limit } },
     { $project: { correct_option: 0, solution_latex: 0 } }
   ]);
 

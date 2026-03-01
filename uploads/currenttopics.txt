@@ -1,0 +1,15 @@
+Mathematics
+​Trigonometry: Covering arc length, radian/degree conversions, evaluating trigonometric expressions, and sector area.  
+​Quadratics: Roots of quadratic equations, sum and product of roots, and the discriminant.  
+​Arithmetic Progression (A.P.): Finding specific terms, common differences, and the sum of series.  
+​Complex Numbers: Simplification, modulus, argument, polar form, and solving complex equations.  
+​Indices: Solving exponential equations and simplifying index expressions.  
+​Logarithms: Evaluating log expressions and solving for variables using logarithmic laws.  
+​Sequences: General sequence definitions and term identification.  
+​Computer Science
+​History of Computing: Early machines like the Abacus, Napier's Bones, and the Slide Rule.  
+​Generations of Computers: Key components and programming levels from the 1st to the 3rd generations.  
+​Information Literacy
+​Definitions: Distinctions between information and knowledge.
+​Information Use: Ethical use of information and citation.
+​Societal Influence: The transformative power of information on individuals and nations.
