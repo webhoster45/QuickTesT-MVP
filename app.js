@@ -20,6 +20,21 @@ const app = express();
 app.use(express.json());
 app.use(cors('*'))
 
+// serve uploaded PDF files so frontend can download them
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// explicit download route (fallback for some environments)
+app.get('/uploads/:filename', (req, res) => {
+  const filename = req.params.filename;
+  const filePath = path.join(__dirname, 'uploads', filename);
+  res.sendFile(filePath, (err) => {
+    if (err) {
+      console.error('sendFile error for', filePath, err && err.code);
+      return res.status(404).send('Not found');
+    }
+  });
+});
+
 /* ==========================================
    CONFIG
 ========================================== */
@@ -201,7 +216,10 @@ app.post("/api/import", authMiddleware, adminMiddleware, async (req, res) => {
       allQuestions = rawData;
     } else {
       for (let key in rawData) {
-        allQuestions = allQuestions.concat(rawData[key]);
+        // attach the top‑level key as courseTitle if present; preserves the
+        // human‑readable title that some datasets use.
+        const arr = rawData[key].map((q) => ({ ...q, courseTitle: key }));
+        allQuestions = allQuestions.concat(arr);
       }
     }
 
@@ -228,6 +246,39 @@ app.post("/api/import", authMiddleware, adminMiddleware, async (req, res) => {
   }
 });
 /* ==========================================
+   METADATA ENDPOINT (courses/topics)
+   returns all distinct values from the question collection
+========================================== */
+
+app.get("/api/metadata", authMiddleware, async (req, res) => {
+  try {
+    const courses = await Question.distinct('course');
+    const topics = await Question.distinct('topic');
+    const difficulties = await Question.distinct('difficulty');
+    // build map of course->title when available
+    const titleAgg = await Question.aggregate([
+      { $match: { courseTitle: { $exists: true, $ne: null } } },
+      { $group: { _id: '$course', title: { $first: '$courseTitle' } } }
+    ]);
+    const courseTitles = {};
+    titleAgg.forEach((r) => {
+      if (r._id) courseTitles[r._id] = r.title;
+    });
+
+    // also precompute topic lists grouped by course so the UI can scope the
+    // dropdown without having to fetch a full question set.
+    const topicsByCourse = {};
+    for (const c of courses) {
+      topicsByCourse[c] = await Question.distinct('topic', { course: c });
+    }
+    res.json({ courses, topics, topicsByCourse, difficulties, courseTitles });
+  } catch (err) {
+    console.error('metadata error', err);
+    res.status(500).json({ message: 'Failed to fetch metadata' });
+  }
+});
+
+/* ==========================================
    GET RANDOM QUESTIONS
 ========================================== */
 
@@ -247,7 +298,8 @@ app.get("/api/questions", authMiddleware, async (req, res) => {
   const questions = await Question.aggregate([
     { $match: filter },
     { $sample: { size: limit } },
-    { $project: { correct_option: 0, solution_latex: 0 } }
+    // do not expose correct_option; solutions may be shown after submission
+    { $project: { correct_option: 0 } }
   ]);
 
   res.json(questions);
@@ -303,7 +355,9 @@ app.post("/api/submit", authMiddleware, async (req, res) => {
     answers: detailedAnswers
   });
 
-  res.json({ total: uniqueAnswers.length, score, percentage });
+  // return detailed answers so the client can render correctness without
+  // needing to re-fetch anything
+  res.json({ total: uniqueAnswers.length, score, percentage, detailedAnswers });
 });
 
 /* ==========================================
@@ -322,6 +376,7 @@ app.get("/api/my-attempts", authMiddleware, async (req, res) => {
 ========================================== */
 
 app.get("/api/leaderboard", async (req, res) => {
+  // aggregate average percentages per user and pull username for display
   const leaderboard = await QuizAttempt.aggregate([
     {
       $group: {
@@ -330,7 +385,23 @@ app.get("/api/leaderboard", async (req, res) => {
       }
     },
     { $sort: { avgScore: -1 } },
-    { $limit: 10 }
+    { $limit: 10 },
+    // lookup user document to get username
+    {
+      $lookup: {
+        from: "users",
+        localField: "_id",
+        foreignField: "_id",
+        as: "user"
+      }
+    },
+    { $unwind: { path: "$user", preserveNullAndEmptyArrays: true } },
+    {
+      $project: {
+        avgScore: 1,
+        username: "$user.username"
+      }
+    }
   ]);
 
   res.json(leaderboard);
@@ -356,7 +427,16 @@ app.post("/api/upload-pdf",
       originalname: req.file.originalname
     });
 
-    res.json({ message: "PDF uploaded and pending review" });
+    // log and return a download URL to help frontend debugging
+    const downloadUrl = `/uploads/${req.file.filename}`;
+    console.log('Uploaded PDF:', {
+      filename: req.file.filename,
+      originalname: req.file.originalname,
+      downloadUrl,
+      savedAt: path.join(__dirname, 'uploads', req.file.filename)
+    });
+
+    res.json({ message: "PDF uploaded and pending review", url: downloadUrl });
 });
 
 /* ==========================================
