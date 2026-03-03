@@ -20,27 +20,172 @@ const app = express();
 app.use(express.json());
 app.use(cors('*'))
 
-// serve uploaded PDF files so frontend can download them
+// serve uploaded files so frontend can download them
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // explicit download route (fallback for some environments)
-app.get('/uploads/:filename', (req, res) => {
-  const filename = req.params.filename;
-  const filePath = path.join(__dirname, 'uploads', filename);
-  res.sendFile(filePath, (err) => {
-    if (err) {
-      console.error('sendFile error for', filePath, err && err.code);
-      return res.status(404).send('Not found');
+app.get('/uploads/*requestedPath', async (req, res) => {
+  const requestedParam = req.params.requestedPath;
+  const rawRequestedPath = Array.isArray(requestedParam)
+    ? requestedParam.join('/')
+    : requestedParam;
+  const requestedPath = rawRequestedPath ? decodeURIComponent(rawRequestedPath) : rawRequestedPath;
+
+  if (!requestedPath) {
+    return res.status(404).send('Not found');
+  }
+
+  // First try local file (backward compatibility for older stored uploads)
+  const filePath = path.join(__dirname, 'uploads', requestedPath);
+  if (fs.existsSync(filePath)) {
+    return res.sendFile(filePath);
+  }
+
+  // Then try Cloudinary-backed records (for new serverless uploads)
+  try {
+    const objectIdQuery = mongoose.Types.ObjectId.isValid(requestedPath)
+      ? [{ _id: requestedPath }]
+      : [];
+
+    const uploadRecord = await PdfUpload.findOne({
+      $or: [
+        { filename: requestedPath },
+        { cloudinaryPublicId: requestedPath },
+        ...objectIdQuery
+      ]
+    });
+
+    if (uploadRecord?.fileUrl) {
+      return res.redirect(uploadRecord.fileUrl);
     }
-  });
+  } catch (error) {
+    console.error('uploads lookup error for', requestedPath, error);
+  }
+
+  return res.status(404).send('Not found');
 });
 
 /* ==========================================
    CONFIG
 ========================================== */
 
+const crypto = require("crypto");
+
 const PORT =process.env.PORT|| 5000;
 
+function getCloudinaryConfig() {
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+  const apiKey = process.env.CLOUDINARY_API_KEY;
+  const apiSecret = process.env.CLOUDINARY_API_SECRET;
+
+  if (cloudName && apiKey && apiSecret) {
+    return { cloudName, apiKey, apiSecret };
+  }
+
+  const cloudinaryUrl = process.env.CLOUDINARY_URL;
+  if (!cloudinaryUrl) return null;
+
+  try {
+    const parsed = new URL(cloudinaryUrl);
+    const derivedCloudName = parsed.hostname;
+    const derivedApiKey = decodeURIComponent(parsed.username || "");
+    const derivedApiSecret = decodeURIComponent(parsed.password || "");
+
+    if (derivedCloudName && derivedApiKey && derivedApiSecret) {
+      return {
+        cloudName: derivedCloudName,
+        apiKey: derivedApiKey,
+        apiSecret: derivedApiSecret
+      };
+    }
+  } catch (error) {
+    console.warn("Invalid CLOUDINARY_URL format.");
+  }
+
+  return null;
+}
+
+const cloudinaryConfig = getCloudinaryConfig();
+const hasCloudinaryConfig = !!cloudinaryConfig;
+
+if (!hasCloudinaryConfig) {
+  console.warn("Cloudinary is not configured. Set CLOUDINARY_URL or CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET.");
+}
+
+const ALLOWED_UPLOAD_MIME_TYPES = new Set([
+  "application/pdf",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif"
+]);
+
+function isAllowedUploadMimeType(mimeType) {
+  return ALLOWED_UPLOAD_MIME_TYPES.has(mimeType);
+}
+
+function buildUploadFilename(originalname, mimeType) {
+  const normalizedBaseName = (originalname || "upload")
+    .replace(/\.[a-z0-9]+$/i, "")
+    .replace(/[^a-zA-Z0-9_-]/g, "-")
+    .slice(0, 40) || "file";
+
+  const extensionByMimeType = {
+    "application/pdf": "pdf",
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif"
+  };
+
+  const extension = extensionByMimeType[mimeType] || "bin";
+  return `${normalizedBaseName}.${extension}`;
+}
+
+async function uploadFileToCloudinary(fileBuffer, originalname, mimeType) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const normalizedName = (originalname || "upload")
+    .replace(/\.[a-z0-9]+$/i, "")
+    .replace(/[^a-zA-Z0-9_-]/g, "-")
+    .slice(0, 40);
+  const publicId = `file-${Date.now()}-${normalizedName || "file"}`;
+  const folder = "quicktest/uploads";
+
+  const paramsToSign = {
+    folder,
+    public_id: publicId,
+    timestamp
+  };
+
+  const signaturePayload = Object.keys(paramsToSign)
+    .sort()
+    .map((key) => `${key}=${paramsToSign[key]}`)
+    .join("&");
+
+  const signature = crypto
+    .createHash("sha1")
+    .update(`${signaturePayload}${cloudinaryConfig.apiSecret}`)
+    .digest("hex");
+
+  const uploadFilename = buildUploadFilename(originalname, mimeType);
+  const form = new FormData();
+  form.append("file", new Blob([fileBuffer], { type: mimeType }), uploadFilename);
+  form.append("api_key", cloudinaryConfig.apiKey);
+  form.append("timestamp", String(timestamp));
+  form.append("signature", signature);
+  form.append("folder", folder);
+  form.append("public_id", publicId);
+
+  const uploadUrl = `https://api.cloudinary.com/v1_1/${cloudinaryConfig.cloudName}/auto/upload`;
+  const response = await fetch(uploadUrl, { method: "POST", body: form });
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data?.error?.message || "Cloudinary upload failed");
+  }
+
+  return data;
+}
 
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB Connected"))
@@ -95,6 +240,10 @@ const pdfUploadSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   filename: String,
   originalname: String,
+  fileUrl: String,
+  cloudinaryPublicId: String,
+  mimeType: String,
+  resourceType: String,
   status: {
     type: String,
     enum: ["pending", "approved", "rejected"],
@@ -132,6 +281,14 @@ const adminMiddleware = async (req, res, next) => {
   next();
 };
 
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeUsername(value) {
+  return String(value || "").trim();
+}
+
 /* ==========================================
    REGISTER (ONE ADMIN ONLY)
 ========================================== */
@@ -139,9 +296,15 @@ const adminMiddleware = async (req, res, next) => {
 app.post("/api/register", async (req, res) => {
   try {
     const { username, password, adminSecret } = req.body;
+    const normalizedUsername = normalizeUsername(username);
 
-    if (!username || !password)
+    if (!normalizedUsername || !password)
       return res.status(400).json({ message: "Username and password required" });
+
+    const usernameRegex = new RegExp(`^${escapeRegex(normalizedUsername)}$`, "i");
+    const existingUser = await User.findOne({ username: usernameRegex });
+    if (existingUser)
+      return res.status(400).json({ message: "Username already taken" });
 
     let isAdmin = false;
 
@@ -159,7 +322,7 @@ app.post("/api/register", async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    await User.create({ username, password: hashedPassword, isAdmin });
+    await User.create({ username: normalizedUsername, password: hashedPassword, isAdmin });
 
     res.json({
       message: isAdmin
@@ -184,8 +347,13 @@ app.post("/api/register", async (req, res) => {
 
 app.post("/api/login", async (req, res) => {
   const { username, password } = req.body;
+  const normalizedUsername = normalizeUsername(username);
 
-  const user = await User.findOne({ username });
+  if (!normalizedUsername || !password)
+    return res.status(400).json({ message: "Invalid credentials" });
+
+  const usernameRegex = new RegExp(`^${escapeRegex(normalizedUsername)}$`, "i");
+  const user = await User.findOne({ username: usernameRegex });
   if (!user) return res.status(400).json({ message: "Invalid credentials" });
 
   const match = await bcrypt.compare(password, user.password);
@@ -408,12 +576,12 @@ app.get("/api/leaderboard", async (req, res) => {
 });
 
 /* ==========================================
-   PDF UPLOAD (AUTHENTICATED USERS)
+   FILE UPLOAD (AUTHENTICATED USERS)
 ========================================== */
 
-const upload = multer({ dest: "uploads/" });
+const upload = multer({ storage: multer.memoryStorage() });
 
-app.post("/api/upload-pdf",
+app.post(["/api/upload-pdf", "/api/upload-file"],
   authMiddleware,
   upload.single("file"),
   async (req, res) => {
@@ -421,22 +589,45 @@ app.post("/api/upload-pdf",
     if (!req.file)
       return res.status(400).json({ message: "No file uploaded" });
 
-    await PdfUpload.create({
-      userId: req.user.id,
-      filename: req.file.filename,
-      originalname: req.file.originalname
-    });
+    if (!isAllowedUploadMimeType(req.file.mimetype)) {
+      return res.status(400).json({
+        message: "Only PDF/JPG/PNG/WEBP/GIF files are allowed"
+      });
+    }
 
-    // log and return a download URL to help frontend debugging
-    const downloadUrl = `/uploads/${req.file.filename}`;
-    console.log('Uploaded PDF:', {
-      filename: req.file.filename,
-      originalname: req.file.originalname,
-      downloadUrl,
-      savedAt: path.join(__dirname, 'uploads', req.file.filename)
-    });
+    if (!hasCloudinaryConfig) {
+      return res.status(500).json({
+        message: "Upload service is not configured. Set CLOUDINARY_URL or CLOUDINARY_* env vars."
+      });
+    }
 
-    res.json({ message: "PDF uploaded and pending review", url: downloadUrl });
+    try {
+      const uploadResult = await uploadFileToCloudinary(
+        req.file.buffer,
+        req.file.originalname,
+        req.file.mimetype
+      );
+
+      await PdfUpload.create({
+        userId: req.user.id,
+        filename: uploadResult.public_id,
+        originalname: req.file.originalname,
+        fileUrl: uploadResult.secure_url,
+        cloudinaryPublicId: uploadResult.public_id,
+        mimeType: req.file.mimetype,
+        resourceType: uploadResult.resource_type
+      });
+
+      res.json({
+        message: "File uploaded and pending review",
+        url: uploadResult.secure_url,
+        mimeType: req.file.mimetype,
+        resourceType: uploadResult.resource_type
+      });
+    } catch (error) {
+      console.error("Cloudinary upload failed:", error);
+      res.status(500).json({ message: "Failed to upload file" });
+    }
 });
 
 /* ==========================================
