@@ -115,16 +115,49 @@ if (!hasCloudinaryConfig) {
   console.warn("Cloudinary is not configured. Set CLOUDINARY_URL or CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET.");
 }
 
-const ALLOWED_UPLOAD_MIME_TYPES = new Set([
+const PDF_MIME_TYPES = new Set([
   "application/pdf",
+  "application/x-pdf",
+  "application/acrobat",
+  "applications/vnd.pdf",
+  "text/pdf",
+  "text/x-pdf",
+  "application/octet-stream"
+]);
+
+const IMAGE_MIME_TYPES = new Set([
   "image/jpeg",
   "image/png",
   "image/webp",
-  "image/gif"
+  "image/gif",
+  "image/heic",
+  "image/heif"
 ]);
 
-function isAllowedUploadMimeType(mimeType) {
-  return ALLOWED_UPLOAD_MIME_TYPES.has(mimeType);
+function isPdfBuffer(buffer) {
+  if (!buffer || buffer.length < 5) return false;
+  return buffer.subarray(0, 5).toString("ascii") === "%PDF-";
+}
+
+function resolveUploadKind(file) {
+  const mimeType = String(file?.mimetype || "").toLowerCase().trim();
+  const originalname = String(file?.originalname || "");
+  const hasPdfExtension = /\.pdf$/i.test(originalname);
+  const looksLikePdf = isPdfBuffer(file?.buffer);
+
+  if (mimeType.startsWith("image/") && IMAGE_MIME_TYPES.has(mimeType)) {
+    return { allowed: true, normalizedMimeType: mimeType };
+  }
+
+  if (PDF_MIME_TYPES.has(mimeType) && (looksLikePdf || hasPdfExtension)) {
+    return { allowed: true, normalizedMimeType: "application/pdf" };
+  }
+
+  if (hasPdfExtension && looksLikePdf) {
+    return { allowed: true, normalizedMimeType: "application/pdf" };
+  }
+
+  return { allowed: false, normalizedMimeType: mimeType };
 }
 
 function buildUploadFilename(originalname, mimeType) {
@@ -138,7 +171,9 @@ function buildUploadFilename(originalname, mimeType) {
     "image/jpeg": "jpg",
     "image/png": "png",
     "image/webp": "webp",
-    "image/gif": "gif"
+    "image/gif": "gif",
+    "image/heic": "heic",
+    "image/heif": "heif"
   };
 
   const extension = extensionByMimeType[mimeType] || "bin";
@@ -592,9 +627,10 @@ app.post(["/api/upload-pdf", "/api/upload-file"],
     if (!req.file)
       return res.status(400).json({ message: "No file uploaded" });
 
-    if (!isAllowedUploadMimeType(req.file.mimetype)) {
+    const uploadKind = resolveUploadKind(req.file);
+    if (!uploadKind.allowed) {
       return res.status(400).json({
-        message: "Only PDF/JPG/PNG/WEBP/GIF files are allowed"
+        message: "Only valid PDF/JPG/PNG/WEBP/GIF/HEIC files are allowed"
       });
     }
 
@@ -608,7 +644,7 @@ app.post(["/api/upload-pdf", "/api/upload-file"],
       const uploadResult = await uploadFileToCloudinary(
         req.file.buffer,
         req.file.originalname,
-        req.file.mimetype
+        uploadKind.normalizedMimeType
       );
 
       await PdfUpload.create({
@@ -617,14 +653,14 @@ app.post(["/api/upload-pdf", "/api/upload-file"],
         originalname: req.file.originalname,
         fileUrl: uploadResult.secure_url,
         cloudinaryPublicId: uploadResult.public_id,
-        mimeType: req.file.mimetype,
+        mimeType: uploadKind.normalizedMimeType,
         resourceType: uploadResult.resource_type
       });
 
       res.json({
         message: "File uploaded and pending review",
         url: uploadResult.secure_url,
-        mimeType: req.file.mimetype,
+        mimeType: uploadKind.normalizedMimeType,
         resourceType: uploadResult.resource_type
       });
     } catch (error) {
