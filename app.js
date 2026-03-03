@@ -3,7 +3,10 @@
 // Admin Secret + Quiz History + PDF Workflow
 // ==========================================
 require('dotenv').config();
-require('dns').setServers(['8.8.8.8', '1.1.1.1']);
+const dns = require("dns");
+if (!process.env.VERCEL) {
+  dns.setServers(['8.8.8.8', '1.1.1.1']);
+}
 
 const express = require("express");
 const mongoose = require("mongoose");
@@ -637,12 +640,16 @@ app.post(["/api/upload-pdf", "/api/upload-file"],
 app.get("/api/my-uploads",
   authMiddleware,
   async (req, res) => {
+    try {
+      const uploads = await PdfUpload.find({
+        userId: req.user.id
+      }).sort({ createdAt: -1 });
 
-    const uploads = await PdfUpload.find({
-      userId: req.user.id
-    }).sort({ createdAt: -1 });
-
-    res.json(uploads);
+      res.json(uploads);
+    } catch (error) {
+      console.error("my-uploads error:", error);
+      res.status(500).json({ message: "Failed to fetch uploads" });
+    }
 });
 
 /* ==========================================
@@ -653,12 +660,16 @@ app.get("/api/admin/uploads",
   authMiddleware,
   adminMiddleware,
   async (req, res) => {
+    try {
+      const uploads = await PdfUpload.find()
+        .populate("userId", "username")
+        .sort({ createdAt: -1 });
 
-    const uploads = await PdfUpload.find()
-      .populate("userId", "username")
-      .sort({ createdAt: -1 });
-
-    res.json(uploads);
+      res.json(uploads);
+    } catch (error) {
+      console.error("admin/uploads error:", error);
+      res.status(500).json({ message: "Failed to fetch admin uploads" });
+    }
 });
 
 /* ==========================================
@@ -669,15 +680,19 @@ app.patch("/api/admin/uploads/:id",
   authMiddleware,
   adminMiddleware,
   async (req, res) => {
+    try {
+      const { status } = req.body;
 
-    const { status } = req.body;
+      if (!["approved", "rejected"].includes(status))
+        return res.status(400).json({ message: "Invalid status" });
 
-    if (!["approved", "rejected"].includes(status))
-      return res.status(400).json({ message: "Invalid status" });
+      await PdfUpload.findByIdAndUpdate(req.params.id, { status });
 
-    await PdfUpload.findByIdAndUpdate(req.params.id, { status });
-
-    res.json({ message: `Upload ${status}` });
+      res.json({ message: `Upload ${status}` });
+    } catch (error) {
+      console.error("admin patch upload error:", error);
+      res.status(500).json({ message: "Failed to update upload status" });
+    }
 });
 
 /* ==========================================
@@ -688,18 +703,28 @@ app.get("/api/admin/stats",
   authMiddleware,
   adminMiddleware,
   async (req, res) => {
+    try {
+      const totalUsers = await User.countDocuments();
+      const totalQuestions = await Question.countDocuments();
+      const totalAttempts = await QuizAttempt.countDocuments();
+      const totalUploads = await PdfUpload.countDocuments();
 
-    const totalUsers = await User.countDocuments();
-    const totalQuestions = await Question.countDocuments();
-    const totalAttempts = await QuizAttempt.countDocuments();
-    const totalUploads = await PdfUpload.countDocuments();
+      res.json({
+        totalUsers,
+        totalQuestions,
+        totalAttempts,
+        totalUploads
+      });
+    } catch (error) {
+      console.error("admin stats error:", error);
+      res.status(500).json({ message: "Failed to fetch admin stats" });
+    }
+});
 
-    res.json({
-      totalUsers,
-      totalQuestions,
-      totalAttempts,
-      totalUploads
-    });
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err);
+  if (res.headersSent) return next(err);
+  return res.status(500).json({ message: "Internal Server Error" });
 });
 
 /* ==========================================
