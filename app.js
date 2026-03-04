@@ -225,6 +225,40 @@ async function uploadFileToCloudinary(fileBuffer, originalname, mimeType) {
   return data;
 }
 
+async function deleteFileFromCloudinary(publicId, resourceType = "image") {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const paramsToSign = {
+    public_id: publicId,
+    timestamp
+  };
+
+  const signaturePayload = Object.keys(paramsToSign)
+    .sort()
+    .map((key) => `${key}=${paramsToSign[key]}`)
+    .join("&");
+
+  const signature = crypto
+    .createHash("sha1")
+    .update(`${signaturePayload}${cloudinaryConfig.apiSecret}`)
+    .digest("hex");
+
+  const form = new FormData();
+  form.append("public_id", publicId);
+  form.append("api_key", cloudinaryConfig.apiKey);
+  form.append("timestamp", String(timestamp));
+  form.append("signature", signature);
+
+  const destroyUrl = `https://api.cloudinary.com/v1_1/${cloudinaryConfig.cloudName}/${resourceType}/destroy`;
+  const response = await fetch(destroyUrl, { method: "POST", body: form });
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data?.error?.message || "Cloudinary delete failed");
+  }
+
+  return data;
+}
+
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log("MongoDB Connected"))
   .catch(err => console.error("MongoDB Error:", err));
@@ -730,6 +764,47 @@ app.patch("/api/admin/uploads/:id",
       res.status(500).json({ message: "Failed to update upload status" });
     }
 });
+
+app.delete("/api/admin/uploads/:id",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const uploadId = req.params.id;
+      if (!mongoose.Types.ObjectId.isValid(uploadId)) {
+        return res.status(400).json({ message: "Invalid upload id" });
+      }
+
+      const uploadDoc = await PdfUpload.findById(uploadId);
+      if (!uploadDoc) {
+        return res.status(404).json({ message: "Upload not found" });
+      }
+
+      if (hasCloudinaryConfig && uploadDoc.cloudinaryPublicId) {
+        const deleteResourceType = uploadDoc.resourceType || "image";
+        try {
+          await deleteFileFromCloudinary(uploadDoc.cloudinaryPublicId, deleteResourceType);
+        } catch (deleteErr) {
+          // Fallback for legacy records where resource type may be mismatched.
+          if (deleteResourceType !== "raw") {
+            try {
+              await deleteFileFromCloudinary(uploadDoc.cloudinaryPublicId, "raw");
+            } catch {
+              console.error("cloudinary delete failed:", deleteErr);
+            }
+          } else {
+            console.error("cloudinary delete failed:", deleteErr);
+          }
+        }
+      }
+
+      await PdfUpload.findByIdAndDelete(uploadId);
+      return res.json({ message: "Upload deleted" });
+    } catch (error) {
+      console.error("admin delete upload error:", error);
+      return res.status(500).json({ message: "Failed to delete upload" });
+    }
+  });
 
 /* ==========================================
    ADMIN STATS
