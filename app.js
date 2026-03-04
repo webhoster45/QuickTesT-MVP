@@ -554,6 +554,62 @@ app.get("/api/questions", authMiddleware, async (req, res) => {
   res.json(questions);
 });
 
+function normalizeComparableText(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[_-]/g, " ")
+    .replace(/[^\p{L}\p{N}\s.]/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeComparableText(value) {
+  return normalizeComparableText(value)
+    .split(" ")
+    .filter(Boolean);
+}
+
+function areAnswersEquivalent(correctRaw, selectedRaw) {
+  const correctNormalized = normalizeComparableText(correctRaw);
+  const selectedNormalized = normalizeComparableText(selectedRaw);
+
+  if (!correctNormalized || !selectedNormalized) return false;
+
+  const isMcqAnswer = /^[a-d]$/i.test(correctNormalized);
+  if (isMcqAnswer) {
+    return selectedNormalized.toUpperCase() === correctNormalized.toUpperCase();
+  }
+
+  if (selectedNormalized === correctNormalized) return true;
+
+  // Numeric equivalence: tolerate commas/spacing differences.
+  const correctNumber = Number(correctNormalized.replace(/,/g, ""));
+  const selectedNumber = Number(selectedNormalized.replace(/,/g, ""));
+  if (Number.isFinite(correctNumber) && Number.isFinite(selectedNumber)) {
+    return correctNumber === selectedNumber;
+  }
+
+  // Substring tolerance for short free-response variants.
+  if (
+    correctNormalized.length >= 6 &&
+    selectedNormalized.length >= 4 &&
+    (correctNormalized.includes(selectedNormalized) || selectedNormalized.includes(correctNormalized))
+  ) {
+    return true;
+  }
+
+  // Token overlap tolerance for longer descriptive answers.
+  const correctTokens = tokenizeComparableText(correctNormalized);
+  const selectedTokens = tokenizeComparableText(selectedNormalized);
+  if (correctTokens.length < 3 || selectedTokens.length < 2) return false;
+
+  const correctTokenSet = new Set(correctTokens);
+  const overlap = selectedTokens.filter((t) => correctTokenSet.has(t)).length;
+  const requiredOverlap = Math.max(2, Math.ceil(correctTokens.length * 0.6));
+  return overlap >= requiredOverlap;
+}
+
 /* ==========================================
    SUBMIT QUIZ + SAVE ATTEMPT
 ========================================== */
@@ -574,18 +630,19 @@ app.post("/api/submit", authMiddleware, async (req, res) => {
 
   const questionMap = {};
   questions.forEach(q => {
-    questionMap[q._id] = q.correct_option;
+    questionMap[String(q._id)] = q.correct_option;
   });
 
   let score = 0;
 
   const detailedAnswers = uniqueAnswers.map(ans => {
-    const correct = questionMap[ans.questionId];
-    const isCorrect = correct === ans.selectedOption;
+    const questionId = String(ans.questionId);
+    const correct = questionMap[questionId];
+    const isCorrect = areAnswersEquivalent(correct, ans.selectedOption);
     if (isCorrect) score++;
 
     return {
-      questionId: ans.questionId,
+      questionId,
       selectedOption: ans.selectedOption,
       correctOption: correct,
       isCorrect
