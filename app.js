@@ -17,6 +17,7 @@ const path = require("path");
 const multer = require("multer");
 const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
+const INSECURE_EXPOSE_RESET_TOKEN = process.env.INSECURE_EXPOSE_RESET_TOKEN === "true";
 const cors=require("cors");
 
 const app = express();
@@ -479,13 +480,17 @@ app.post("/api/forgot-password", async (req, res) => {
     user.resetPasswordExpires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
     await user.save();
 
-    // Minimal approach: return the token so frontend can complete reset flow
-    // without email integration. Replace with email delivery in production.
-    return res.status(200).json({
+    const responseBody = {
       message: genericMessage,
-      resetToken: rawToken,
       expiresInSeconds: 15 * 60
-    });
+    };
+
+    // Only expose raw token when explicitly enabled for local/testing use.
+    if (INSECURE_EXPOSE_RESET_TOKEN) {
+      responseBody.resetToken = rawToken;
+    }
+
+    return res.status(200).json(responseBody);
   } catch (error) {
     console.error("forgot-password error:", error);
     return res.status(500).json({ message: "Failed to start password reset" });
