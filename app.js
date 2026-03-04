@@ -49,11 +49,20 @@ app.get('/uploads/*requestedPath', async (req, res) => {
     const objectIdQuery = mongoose.Types.ObjectId.isValid(requestedPath)
       ? [{ _id: requestedPath }]
       : [];
+    const keyCandidates = Array.from(new Set([
+      requestedPath,
+      requestedPath.replace(/^\/+/, ""),
+      `quicktest/uploads/${requestedPath.replace(/^\/+/, "")}`,
+      `quicktest/pdfs/${requestedPath.replace(/^\/+/, "")}`
+    ]));
+    const keyQueries = keyCandidates.flatMap((candidate) => ([
+      { filename: candidate },
+      { cloudinaryPublicId: candidate }
+    ]));
 
     const uploadRecord = await PdfUpload.findOne({
       $or: [
-        { filename: requestedPath },
-        { cloudinaryPublicId: requestedPath },
+        ...keyQueries,
         ...objectIdQuery
       ]
     });
