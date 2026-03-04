@@ -279,7 +279,9 @@ mongoose.connect(process.env.MONGO_URI)
 const userSchema = new mongoose.Schema({
   username: { type: String, unique: true, required: true },
   password: { type: String, required: true },
-  isAdmin: { type: Boolean, default: false }
+  isAdmin: { type: Boolean, default: false },
+  resetPasswordToken: String,
+  resetPasswordExpires: Date
 }, { timestamps: true });
 
 const questionSchema = new mongoose.Schema({
@@ -370,6 +372,10 @@ function normalizeUsername(value) {
   return String(value || "").trim();
 }
 
+function hashResetToken(rawToken) {
+  return crypto.createHash("sha256").update(String(rawToken || "")).digest("hex");
+}
+
 /* ==========================================
    REGISTER (ONE ADMIN ONLY)
 ========================================== */
@@ -446,6 +452,78 @@ app.post("/api/login", async (req, res) => {
   );
 
   res.json({ token, isAdmin: user.isAdmin });
+});
+
+/* ==========================================
+   PASSWORD RESET (MINIMAL TOKEN FLOW)
+========================================== */
+
+app.post("/api/forgot-password", async (req, res) => {
+  try {
+    const normalizedUsername = normalizeUsername(req.body?.username);
+    const genericMessage = "If the account exists, a reset token has been generated.";
+
+    if (!normalizedUsername) {
+      return res.status(200).json({ message: genericMessage });
+    }
+
+    const usernameRegex = new RegExp(`^${escapeRegex(normalizedUsername)}$`, "i");
+    const user = await User.findOne({ username: usernameRegex });
+
+    if (!user) {
+      return res.status(200).json({ message: genericMessage });
+    }
+
+    const rawToken = crypto.randomBytes(32).toString("hex");
+    user.resetPasswordToken = hashResetToken(rawToken);
+    user.resetPasswordExpires = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+    await user.save();
+
+    // Minimal approach: return the token so frontend can complete reset flow
+    // without email integration. Replace with email delivery in production.
+    return res.status(200).json({
+      message: genericMessage,
+      resetToken: rawToken,
+      expiresInSeconds: 15 * 60
+    });
+  } catch (error) {
+    console.error("forgot-password error:", error);
+    return res.status(500).json({ message: "Failed to start password reset" });
+  }
+});
+
+app.post("/api/reset-password", async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {};
+
+    if (!token || !newPassword) {
+      return res.status(400).json({ message: "Token and newPassword are required" });
+    }
+
+    if (String(newPassword).length < 6) {
+      return res.status(400).json({ message: "Password must be at least 6 characters" });
+    }
+
+    const hashedToken = hashResetToken(token);
+    const user = await User.findOne({
+      resetPasswordToken: hashedToken,
+      resetPasswordExpires: { $gt: new Date() }
+    });
+
+    if (!user) {
+      return res.status(400).json({ message: "Invalid or expired reset token" });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+    await user.save();
+
+    return res.json({ message: "Password reset successful" });
+  } catch (error) {
+    console.error("reset-password error:", error);
+    return res.status(500).json({ message: "Failed to reset password" });
+  }
 });
 
 /* ==========================================
