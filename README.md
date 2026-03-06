@@ -184,12 +184,16 @@ Behavior:
 - Deduplicates answers by `questionId`.
 - Computes score and percentage.
 - Stores detailed attempt.
+- If request body omits `course`/`topic`, backend infers them from submitted
+  question IDs so history entries stay labeled correctly.
 Response includes `total`, `score`, `percentage`, `detailedAnswers`.
 
 #### `GET /api/my-attempts` (auth)
 - Without query params: returns array of attempts (backward-compatible).
 - With query params (`page`, `limit`, `course`, `topic`): returns
   `{ attempts, pagination }`.
+- For older records missing `course/topic`, response is enriched from linked
+  question metadata (falls back to `General` / `Mixed Topics`).
 
 #### `GET /api/admin/attempts` (admin)
 - Admin history listing with optional query params:

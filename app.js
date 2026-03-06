@@ -533,6 +533,75 @@ function parsePositiveInt(value, fallback, max) {
   return parsed;
 }
 
+function getMostFrequentValue(values) {
+  const counts = new Map();
+  for (const value of values) {
+    const normalized = String(value || "").trim();
+    if (!normalized) continue;
+    counts.set(normalized, (counts.get(normalized) || 0) + 1);
+  }
+
+  let bestValue = "";
+  let bestCount = 0;
+  for (const [value, count] of counts.entries()) {
+    if (count > bestCount) {
+      bestValue = value;
+      bestCount = count;
+    }
+  }
+  return bestValue;
+}
+
+async function enrichAttemptsWithInferredMetadata(attempts) {
+  if (!Array.isArray(attempts) || !attempts.length) return attempts;
+
+  const questionIdSet = new Set();
+  for (const attempt of attempts) {
+    const answers = Array.isArray(attempt.answers) ? attempt.answers : [];
+    for (const ans of answers) {
+      if (ans?.questionId) {
+        questionIdSet.add(String(ans.questionId));
+      }
+    }
+  }
+
+  if (!questionIdSet.size) return attempts;
+
+  const questionDocs = await Question.find({
+    _id: { $in: Array.from(questionIdSet) }
+  }).select("_id course topic").lean();
+
+  const questionById = new Map(
+    questionDocs.map((q) => [String(q._id), q])
+  );
+
+  return attempts.map((attempt) => {
+    const hasCourse = String(attempt.course || "").trim().length > 0;
+    const hasTopic = String(attempt.topic || "").trim().length > 0;
+    if (hasCourse && hasTopic) return attempt;
+
+    const answers = Array.isArray(attempt.answers) ? attempt.answers : [];
+    const inferredCourses = [];
+    const inferredTopics = [];
+
+    for (const ans of answers) {
+      const q = questionById.get(String(ans?.questionId || ""));
+      if (!q) continue;
+      if (q.course) inferredCourses.push(q.course);
+      if (q.topic) inferredTopics.push(q.topic);
+    }
+
+    const inferredCourse = getMostFrequentValue(inferredCourses);
+    const inferredTopic = getMostFrequentValue(inferredTopics);
+
+    return {
+      ...attempt,
+      course: hasCourse ? attempt.course : inferredCourse || "General",
+      topic: hasTopic ? attempt.topic : inferredTopic || "Mixed Topics"
+    };
+  });
+}
+
 /* ==========================================
    REGISTER (ONE ADMIN ONLY)
 ========================================== */
@@ -892,14 +961,16 @@ app.post("/api/submit", authMiddleware, async (req, res) => {
   });
 
   const percentage = ((score / uniqueAnswers.length) * 100).toFixed(2);
+  const selectedCourse = String(course || "").trim() || getMostFrequentValue(questions.map((q) => q.course)) || "General";
+  const selectedTopic = String(topic || "").trim() || getMostFrequentValue(questions.map((q) => q.topic)) || "Mixed Topics";
 
   await QuizAttempt.create({
     userId: req.user.id,
     score,
     total: uniqueAnswers.length,
     percentage,
-    course,
-    topic,
+    course: selectedCourse,
+    topic: selectedTopic,
     answers: detailedAnswers
   });
 
@@ -925,8 +996,9 @@ app.get("/api/my-attempts", authMiddleware, async (req, res) => {
   if (topic && topic !== "All Topics") filter.topic = topic;
 
   if (!hasAdvancedQuery) {
-    const attempts = await QuizAttempt.find(filter).sort({ createdAt: -1 });
-    return res.json(attempts);
+    const attempts = await QuizAttempt.find(filter).sort({ createdAt: -1 }).lean();
+    const enrichedAttempts = await enrichAttemptsWithInferredMetadata(attempts);
+    return res.json(enrichedAttempts);
   }
 
   const safePage = parsePositiveInt(page, 1);
@@ -934,12 +1006,13 @@ app.get("/api/my-attempts", authMiddleware, async (req, res) => {
   const skip = (safePage - 1) * safeLimit;
 
   const [attempts, total] = await Promise.all([
-    QuizAttempt.find(filter).sort({ createdAt: -1 }).skip(skip).limit(safeLimit),
+    QuizAttempt.find(filter).sort({ createdAt: -1 }).skip(skip).limit(safeLimit).lean(),
     QuizAttempt.countDocuments(filter)
   ]);
+  const enrichedAttempts = await enrichAttemptsWithInferredMetadata(attempts);
 
   return res.json({
-    attempts,
+    attempts: enrichedAttempts,
     pagination: {
       page: safePage,
       limit: safeLimit,
@@ -981,12 +1054,14 @@ app.get("/api/admin/attempts",
           .populate("userId", "username")
           .sort({ createdAt: -1 })
           .skip(skip)
-          .limit(safeLimit),
+          .limit(safeLimit)
+          .lean(),
         QuizAttempt.countDocuments(filter)
       ]);
+      const enrichedAttempts = await enrichAttemptsWithInferredMetadata(attempts);
 
       return res.json({
-        attempts,
+        attempts: enrichedAttempts,
         pagination: {
           page: safePage,
           limit: safeLimit,
