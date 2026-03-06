@@ -340,6 +340,64 @@ const Question = mongoose.model("Question", questionSchema);
 const QuizAttempt = mongoose.model("QuizAttempt", quizAttemptSchema);
 const PdfUpload = mongoose.model("PdfUpload", pdfUploadSchema);
 
+function flattenQuestionsPayload(rawData) {
+  if (Array.isArray(rawData)) return rawData;
+
+  let allQuestions = [];
+  for (const key in rawData) {
+    const arr = Array.isArray(rawData[key]) ? rawData[key] : [];
+    allQuestions = allQuestions.concat(arr.map((q) => ({ ...q, courseTitle: key })));
+  }
+  return allQuestions;
+}
+
+async function syncQuestionsFromFile(fileName = "questionsmvp.json") {
+  const filePath = path.join(__dirname, fileName);
+  if (!fs.existsSync(filePath)) {
+    console.warn(`Question sync skipped: ${fileName} not found`);
+    return;
+  }
+
+  const rawData = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  const allQuestions = flattenQuestionsPayload(rawData);
+  if (!allQuestions.length) {
+    console.warn("Question sync skipped: no records found in JSON file");
+    return;
+  }
+
+  const ops = allQuestions.map((q) => ({
+    updateOne: {
+      filter: {
+        course: q.course,
+        topic: q.topic,
+        question_latex: q.question_latex
+      },
+      update: { $setOnInsert: q },
+      upsert: true
+    }
+  }));
+
+  const result = await Question.bulkWrite(ops, { ordered: false });
+  const inserted = result.upsertedCount || 0;
+  if (inserted > 0) {
+    console.log(`Question sync completed: ${inserted} new question(s) inserted`);
+  } else {
+    console.log("Question sync completed: no new questions to insert");
+  }
+}
+
+if (mongoose.connection.readyState === 1) {
+  syncQuestionsFromFile().catch((error) => {
+    console.error("Automatic question sync failed:", error);
+  });
+} else {
+  mongoose.connection.once("open", () => {
+    syncQuestionsFromFile().catch((error) => {
+      console.error("Automatic question sync failed:", error);
+    });
+  });
+}
+
 /* ==========================================
    AUTH MIDDLEWARE
 ========================================== */
@@ -542,18 +600,7 @@ app.post("/api/import", authMiddleware, adminMiddleware, async (req, res) => {
 
     const rawData = JSON.parse(fs.readFileSync(filePath, "utf-8"));
 
-    let allQuestions = [];
-
-    if (Array.isArray(rawData)) {
-      allQuestions = rawData;
-    } else {
-      for (let key in rawData) {
-        // attach the top‑level key as courseTitle if present; preserves the
-        // human‑readable title that some datasets use.
-        const arr = rawData[key].map((q) => ({ ...q, courseTitle: key }));
-        allQuestions = allQuestions.concat(arr);
-      }
-    }
+    const allQuestions = flattenQuestionsPayload(rawData);
 
     let inserted = 0;
     let skipped = 0;
@@ -1012,3 +1059,4 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
