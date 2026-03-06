@@ -351,14 +351,46 @@ function flattenQuestionsPayload(rawData) {
   return allQuestions;
 }
 
-async function syncQuestionsFromFile(fileName = "questionsmvp.json") {
-  const filePath = path.join(__dirname, fileName);
+function loadQuestionsPayload(fileName = "questionsmvp.json") {
+  const normalizedFileName = String(fileName || "questionsmvp.json");
+  const safeFileName = path.basename(normalizedFileName);
+  if (safeFileName !== normalizedFileName) {
+    throw new Error("Invalid file name");
+  }
+
+  // Default question bank: support both filesystem and serverless bundle loading.
+  if (safeFileName === "questionsmvp.json") {
+    const defaultPath = path.join(__dirname, safeFileName);
+    if (fs.existsSync(defaultPath)) {
+      return JSON.parse(fs.readFileSync(defaultPath, "utf-8"));
+    }
+
+    try {
+      return require("./questionsmvp.json");
+    } catch {
+      throw new Error(
+        "Default question bank not found. Ensure questionsmvp.json is committed and included in deployment."
+      );
+    }
+  }
+
+  const filePath = path.join(__dirname, safeFileName);
   if (!fs.existsSync(filePath)) {
-    console.warn(`Question sync skipped: ${fileName} not found`);
+    throw new Error(`Question file not found: ${safeFileName}`);
+  }
+
+  return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+}
+
+async function syncQuestionsFromFile(fileName = "questionsmvp.json") {
+  let rawData;
+  try {
+    rawData = loadQuestionsPayload(fileName);
+  } catch (error) {
+    console.warn(`Question sync skipped: ${error.message}`);
     return;
   }
 
-  const rawData = JSON.parse(fs.readFileSync(filePath, "utf-8"));
   const allQuestions = flattenQuestionsPayload(rawData);
   if (!allQuestions.length) {
     console.warn("Question sync skipped: no records found in JSON file");
@@ -596,9 +628,7 @@ app.post("/api/reset-password", async (req, res) => {
 app.post("/api/import", authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const fileName = req.body?.fileName || "questionsmvp.json";
-    const filePath = path.join(__dirname, fileName);
-
-    const rawData = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    const rawData = loadQuestionsPayload(fileName);
 
     const allQuestions = flattenQuestionsPayload(rawData);
 
