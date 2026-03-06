@@ -627,14 +627,32 @@ app.get("/api/questions", authMiddleware, async (req, res) => {
   if (topic) filter.topic = topic;
   if (difficulty) filter.difficulty = difficulty;
 
-  const questions = await Question.aggregate([
-    { $match: filter },
-    { $sample: { size: limit } },
-    // do not expose correct_option; solutions may be shown after submission
-    { $project: { correct_option: 0 } }
-  ]);
+  const allQuestions = await Question.find(filter).lean();
 
-  res.json(questions);
+  const isUsableOption = (value) => {
+    const normalized = String(value || "").trim().toLowerCase();
+    return normalized !== "" && normalized !== "n/a";
+  };
+
+  // Data cleanup guard: remove records that have no usable options at all.
+  const usableQuestions = allQuestions.filter((q) => {
+    const usableOptionCount = [
+      q.option_a,
+      q.option_b,
+      q.option_c,
+      q.option_d
+    ].filter(isUsableOption).length;
+
+    return usableOptionCount > 0;
+  });
+
+  const shuffled = usableQuestions.sort(() => Math.random() - 0.5);
+  const picked = shuffled.slice(0, limit).map((q) => {
+    const { correct_option, ...safe } = q;
+    return safe;
+  });
+
+  res.json(picked);
 });
 
 function normalizeComparableText(value) {
