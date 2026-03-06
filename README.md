@@ -142,6 +142,8 @@ Errors: `400` invalid credentials.
 - Imports JSON file from disk (`questionsmvp.json` by default).
 - Supports either array JSON or object-of-arrays format.
 - Inserts questions; duplicates are skipped.
+- Serverless-safe behavior: for default `questionsmvp.json`, backend now falls
+  back to bundled `require("./questionsmvp.json")` if filesystem path is missing.
 Response:
 ```json
 { "inserted": 0, "skipped": 0 }
@@ -257,3 +259,5 @@ Reason: an admin already exists in the database, so a new admin cannot be create
 - Express 5 requires named wildcard route syntax; `/uploads/*requestedPath` is the compatible form.
 - Upload endpoint validates mime type but does not inspect PDF binary signature.
 - `percentage` is stored as a string (because of `toFixed(2)`) though used numerically in leaderboard aggregation.
+- If Vercel returns `ENOENT: ... /var/task/questionsmvp.json` on `/api/import`,
+  redeploy to include latest backend commit `84bcfba` (serverless fallback loader added).
