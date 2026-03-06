@@ -351,49 +351,108 @@ function flattenQuestionsPayload(rawData) {
   return allQuestions;
 }
 
-function loadQuestionsPayload(fileName = "questionsmvp.json") {
-  const normalizedFileName = String(fileName || "questionsmvp.json");
+const QUESTION_BANK_DIR = path.join(__dirname, "question-banks");
+
+function attachCourseTitleFromFileName(questions, fileName) {
+  const courseTitle = path.basename(fileName, path.extname(fileName));
+  return questions.map((q) => ({
+    ...q,
+    courseTitle: q.courseTitle || courseTitle
+  }));
+}
+
+function loadQuestionsFromOneFile(filePath) {
+  const rawData = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  const flattened = flattenQuestionsPayload(rawData);
+  return Array.isArray(rawData)
+    ? attachCourseTitleFromFileName(flattened, path.basename(filePath))
+    : flattened;
+}
+
+function loadQuestionsPayload(fileName) {
+  // Default behavior: import all JSON files from question-banks folder.
+  if (!fileName) {
+    if (!fs.existsSync(QUESTION_BANK_DIR)) {
+      throw new Error("question-banks folder is missing");
+    }
+
+    const files = fs
+      .readdirSync(QUESTION_BANK_DIR)
+      .filter((name) => name.toLowerCase().endsWith(".json"))
+      .sort();
+
+    if (!files.length) {
+      throw new Error("No JSON files found in question-banks folder");
+    }
+
+    const allQuestions = files.flatMap((name) =>
+      loadQuestionsFromOneFile(path.join(QUESTION_BANK_DIR, name))
+    );
+
+    return { allQuestions, sourceFiles: files };
+  }
+
+  const normalizedFileName = String(fileName);
   const safeFileName = path.basename(normalizedFileName);
   if (safeFileName !== normalizedFileName) {
     throw new Error("Invalid file name");
   }
 
-  // Default question bank: support both filesystem and serverless bundle loading.
+  const preferredPath = path.join(QUESTION_BANK_DIR, safeFileName);
+  if (fs.existsSync(preferredPath)) {
+    return {
+      allQuestions: loadQuestionsFromOneFile(preferredPath),
+      sourceFiles: [safeFileName]
+    };
+  }
+
+  const legacyPath = path.join(__dirname, safeFileName);
+  if (fs.existsSync(legacyPath)) {
+    const rawData = JSON.parse(fs.readFileSync(legacyPath, "utf-8"));
+    return {
+      allQuestions: flattenQuestionsPayload(rawData),
+      sourceFiles: [safeFileName]
+    };
+  }
+
   if (safeFileName === "questionsmvp.json") {
-    const defaultPath = path.join(__dirname, safeFileName);
-    if (fs.existsSync(defaultPath)) {
-      return JSON.parse(fs.readFileSync(defaultPath, "utf-8"));
+    if (fs.existsSync(QUESTION_BANK_DIR)) {
+      const files = fs
+        .readdirSync(QUESTION_BANK_DIR)
+        .filter((name) => name.toLowerCase().endsWith(".json"))
+        .sort();
+      if (files.length) {
+        const allQuestions = files.flatMap((name) =>
+          loadQuestionsFromOneFile(path.join(QUESTION_BANK_DIR, name))
+        );
+        return { allQuestions, sourceFiles: files };
+      }
     }
 
     try {
-      return require("./questionsmvp.json");
+      return {
+        allQuestions: flattenQuestionsPayload(require("./questionsmvp.json")),
+        sourceFiles: [safeFileName]
+      };
     } catch {
-      throw new Error(
-        "Default question bank not found. Ensure questionsmvp.json is committed and included in deployment."
-      );
+      throw new Error("questionsmvp.json not found in question-banks or deployment bundle");
     }
   }
 
-  const filePath = path.join(__dirname, safeFileName);
-  if (!fs.existsSync(filePath)) {
-    throw new Error(`Question file not found: ${safeFileName}`);
-  }
-
-  return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  throw new Error(`Question file not found: ${safeFileName}`);
 }
 
-async function syncQuestionsFromFile(fileName = "questionsmvp.json") {
-  let rawData;
+async function syncQuestionsFromFile(fileName) {
+  let allQuestions = [];
   try {
-    rawData = loadQuestionsPayload(fileName);
+    allQuestions = loadQuestionsPayload(fileName).allQuestions;
   } catch (error) {
     console.warn(`Question sync skipped: ${error.message}`);
     return;
   }
 
-  const allQuestions = flattenQuestionsPayload(rawData);
   if (!allQuestions.length) {
-    console.warn("Question sync skipped: no records found in JSON file");
+    console.warn("Question sync skipped: no records found in source files");
     return;
   }
 
@@ -465,6 +524,13 @@ function normalizeUsername(value) {
 
 function hashResetToken(rawToken) {
   return crypto.createHash("sha256").update(String(rawToken || "")).digest("hex");
+}
+
+function parsePositiveInt(value, fallback, max) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  if (max && parsed > max) return max;
+  return parsed;
 }
 
 /* ==========================================
@@ -627,10 +693,8 @@ app.post("/api/reset-password", async (req, res) => {
 
 app.post("/api/import", authMiddleware, adminMiddleware, async (req, res) => {
   try {
-    const fileName = req.body?.fileName || "questionsmvp.json";
-    const rawData = loadQuestionsPayload(fileName);
-
-    const allQuestions = flattenQuestionsPayload(rawData);
+    const fileName = req.body?.fileName;
+    const { allQuestions, sourceFiles } = loadQuestionsPayload(fileName);
 
     let inserted = 0;
     let skipped = 0;
@@ -644,7 +708,7 @@ app.post("/api/import", authMiddleware, adminMiddleware, async (req, res) => {
       }
     }
 
-    res.json({ inserted, skipped });
+    res.json({ inserted, skipped, sourceFiles });
 
   } catch (err) {
     console.log("IMPORT ERROR:", err);
@@ -849,11 +913,92 @@ app.post("/api/submit", authMiddleware, async (req, res) => {
 ========================================== */
 
 app.get("/api/my-attempts", authMiddleware, async (req, res) => {
-  const attempts = await QuizAttempt.find({ userId: req.user.id })
-    .sort({ createdAt: -1 });
+  const { page, limit, course, topic } = req.query || {};
+  const hasAdvancedQuery =
+    page !== undefined ||
+    limit !== undefined ||
+    Boolean(course) ||
+    Boolean(topic);
 
-  res.json(attempts);
+  const filter = { userId: req.user.id };
+  if (course) filter.course = course;
+  if (topic && topic !== "All Topics") filter.topic = topic;
+
+  if (!hasAdvancedQuery) {
+    const attempts = await QuizAttempt.find(filter).sort({ createdAt: -1 });
+    return res.json(attempts);
+  }
+
+  const safePage = parsePositiveInt(page, 1);
+  const safeLimit = parsePositiveInt(limit, 20, 100);
+  const skip = (safePage - 1) * safeLimit;
+
+  const [attempts, total] = await Promise.all([
+    QuizAttempt.find(filter).sort({ createdAt: -1 }).skip(skip).limit(safeLimit),
+    QuizAttempt.countDocuments(filter)
+  ]);
+
+  return res.json({
+    attempts,
+    pagination: {
+      page: safePage,
+      limit: safeLimit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / safeLimit))
+    }
+  });
 });
+
+app.get("/api/admin/attempts",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { page, limit, course, topic, username } = req.query || {};
+      const safePage = parsePositiveInt(page, 1);
+      const safeLimit = parsePositiveInt(limit, 25, 100);
+      const skip = (safePage - 1) * safeLimit;
+
+      const filter = {};
+      if (course) filter.course = course;
+      if (topic && topic !== "All Topics") filter.topic = topic;
+
+      if (username) {
+        const usernameRegex = new RegExp(escapeRegex(String(username).trim()), "i");
+        const users = await User.find({ username: usernameRegex }).select("_id");
+        const userIds = users.map((u) => u._id);
+        if (!userIds.length) {
+          return res.json({
+            attempts: [],
+            pagination: { page: safePage, limit: safeLimit, total: 0, totalPages: 1 }
+          });
+        }
+        filter.userId = { $in: userIds };
+      }
+
+      const [attempts, total] = await Promise.all([
+        QuizAttempt.find(filter)
+          .populate("userId", "username")
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(safeLimit),
+        QuizAttempt.countDocuments(filter)
+      ]);
+
+      return res.json({
+        attempts,
+        pagination: {
+          page: safePage,
+          limit: safeLimit,
+          total,
+          totalPages: Math.max(1, Math.ceil(total / safeLimit))
+        }
+      });
+    } catch (error) {
+      console.error("admin attempts error:", error);
+      return res.status(500).json({ message: "Failed to fetch admin attempts" });
+    }
+  });
 
 /* ==========================================
    LEADERBOARD (TOP 10 BY AVG SCORE)
@@ -889,6 +1034,14 @@ app.get("/api/leaderboard", async (req, res) => {
   ]);
 
   res.json(leaderboard);
+});
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    uptimeSeconds: Math.round(process.uptime()),
+    timestamp: new Date().toISOString()
+  });
 });
 
 /* ==========================================

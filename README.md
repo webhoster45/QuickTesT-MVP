@@ -13,7 +13,7 @@ Express + MongoDB backend for quiz delivery, scoring, leaderboard, and PDF uploa
 
 ## Project Files
 - `app.js`: Entire server, models, middleware, and routes
-- `questionsmvp.json`: Source quiz dataset used by admin import endpoint
+- `question-banks/`: Folder containing per-course JSON files (one file per bank)
 - `.env`: Runtime secrets/config
 
 ## Environment Variables
@@ -111,6 +111,9 @@ Cloudinary (choose one approach):
 - Top 10 users by average percentage.
 - Uses Mongo aggregation + user lookup.
 
+#### `GET /api/health`
+- Lightweight health probe for uptime/deployment checks.
+
 ### Auth
 #### `POST /api/register`
 Body:
@@ -139,14 +142,13 @@ Errors: `400` invalid credentials.
 
 ### Questions/Quiz
 #### `POST /api/import` (admin)
-- Imports JSON file from disk (`questionsmvp.json` by default).
-- Supports either array JSON or object-of-arrays format.
+- Imports all JSON files from `question-banks/` by default.
+- Optional body: `{ "fileName": "CHM_101_General_Chemistry.json" }` to import one file.
+- Supports array JSON and object-of-arrays format.
 - Inserts questions; duplicates are skipped.
-- Serverless-safe behavior: for default `questionsmvp.json`, backend now falls
-  back to bundled `require("./questionsmvp.json")` if filesystem path is missing.
 Response:
 ```json
-{ "inserted": 0, "skipped": 0 }
+{ "inserted": 0, "skipped": 0, "sourceFiles": ["..."] }
 ```
 
 #### `GET /api/metadata` (auth)
@@ -185,7 +187,22 @@ Behavior:
 Response includes `total`, `score`, `percentage`, `detailedAnswers`.
 
 #### `GET /api/my-attempts` (auth)
-- Returns current user attempts sorted newest first.
+- Without query params: returns array of attempts (backward-compatible).
+- With query params (`page`, `limit`, `course`, `topic`): returns
+  `{ attempts, pagination }`.
+
+#### `GET /api/admin/attempts` (admin)
+- Admin history listing with optional query params:
+  - `page`, `limit`
+  - `course`, `topic`
+  - `username` (case-insensitive partial match)
+- Returns:
+```json
+{
+  "attempts": [],
+  "pagination": { "page": 1, "limit": 25, "total": 0, "totalPages": 1 }
+}
+```
 
 ### File Workflow (PDF + Images)
 #### `POST /api/upload-pdf` or `POST /api/upload-file` (auth)
@@ -259,5 +276,5 @@ Reason: an admin already exists in the database, so a new admin cannot be create
 - Express 5 requires named wildcard route syntax; `/uploads/*requestedPath` is the compatible form.
 - Upload endpoint validates mime type but does not inspect PDF binary signature.
 - `percentage` is stored as a string (because of `toFixed(2)`) though used numerically in leaderboard aggregation.
-- If Vercel returns `ENOENT: ... /var/task/questionsmvp.json` on `/api/import`,
-  redeploy to include latest backend commit `84bcfba` (serverless fallback loader added).
+- To add a new course bank, create a new `.json` file in `question-banks/`.
+  On next `/api/import` (or startup sync), it will be auto-discovered and imported.
