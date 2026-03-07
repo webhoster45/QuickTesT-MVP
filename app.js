@@ -852,8 +852,11 @@ app.get("/api/questions", authMiddleware, async (req, res) => {
       q.option_c,
       q.option_d
     ].filter(isUsableOption).length;
-
-    return usableOptionCount > 0;
+    // allow:
+    // - regular MCQ with at least two usable options (e.g., True/False)
+    // - free-response records with no usable options
+    // reject one-option broken records that cause poor rendering.
+    return usableOptionCount === 0 || usableOptionCount >= 2;
   });
 
   const shuffled = usableQuestions.sort(() => Math.random() - 0.5);
