@@ -794,29 +794,63 @@ app.post("/api/import", authMiddleware, adminMiddleware, async (req, res) => {
 
 app.get("/api/metadata", authMiddleware, async (req, res) => {
   try {
-    const courses = await Question.distinct('course');
-    const topics = await Question.distinct('topic');
-    const difficulties = await Question.distinct('difficulty');
-    // build map of course->title when available
-    const titleAgg = await Question.aggregate([
-      { $match: { courseTitle: { $exists: true, $ne: null } } },
-      { $group: { _id: '$course', title: { $first: '$courseTitle' } } }
-    ]);
-    const courseTitles = {};
-    titleAgg.forEach((r) => {
-      if (r._id) courseTitles[r._id] = r.title;
-    });
+    const [coursesResult, topicsResult, difficultiesResult, titleAggResult, topicsByCourseAggResult] =
+      await Promise.allSettled([
+        Question.distinct("course"),
+        Question.distinct("topic"),
+        Question.distinct("difficulty"),
+        Question.aggregate([
+          { $match: { courseTitle: { $exists: true, $ne: null } } },
+          { $group: { _id: "$course", title: { $first: "$courseTitle" } } }
+        ]),
+        Question.aggregate([
+          { $match: { course: { $exists: true, $ne: null } } },
+          { $group: { _id: "$course", topics: { $addToSet: "$topic" } } }
+        ])
+      ]);
 
-    // also precompute topic lists grouped by course so the UI can scope the
-    // dropdown without having to fetch a full question set.
-    const topicsByCourse = {};
-    for (const c of courses) {
-      topicsByCourse[c] = await Question.distinct('topic', { course: c });
+    const courses = coursesResult.status === "fulfilled"
+      ? coursesResult.value.filter(Boolean).map((v) => String(v))
+      : [];
+    const topics = topicsResult.status === "fulfilled"
+      ? topicsResult.value.filter(Boolean).map((v) => String(v))
+      : [];
+    const difficulties = difficultiesResult.status === "fulfilled"
+      ? difficultiesResult.value.filter(Boolean).map((v) => String(v))
+      : [];
+
+    const courseTitles = {};
+    if (titleAggResult.status === "fulfilled") {
+      titleAggResult.value.forEach((row) => {
+        if (!row?._id) return;
+        courseTitles[String(row._id)] = String(row.title || row._id);
+      });
     }
+
+    const topicsByCourse = {};
+    if (topicsByCourseAggResult.status === "fulfilled") {
+      topicsByCourseAggResult.value.forEach((row) => {
+        if (!row?._id) return;
+        topicsByCourse[String(row._id)] = Array.isArray(row.topics)
+          ? row.topics.filter(Boolean).map((v) => String(v))
+          : [];
+      });
+    } else {
+      courses.forEach((course) => {
+        topicsByCourse[course] = [];
+      });
+    }
+
     res.json({ courses, topics, topicsByCourse, difficulties, courseTitles });
   } catch (err) {
     console.error('metadata error', err);
-    res.status(500).json({ message: 'Failed to fetch metadata' });
+    res.json({
+      courses: [],
+      topics: [],
+      topicsByCourse: {},
+      difficulties: [],
+      courseTitles: {}
+    });
   }
 });
 
