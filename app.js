@@ -295,7 +295,10 @@ const questionSchema = new mongoose.Schema({
   option_d: String,
   correct_option: { type: String, required: true },
   difficulty: { type: String, required: true },
-  solution_latex: String
+  solution_latex: String,
+  qualityScore: { type: Number, default: 100 },
+  qualityIssues: { type: [String], default: [] },
+  needsReview: { type: Boolean, default: false }
 }, { timestamps: true });
 
 questionSchema.index(
@@ -456,7 +459,8 @@ async function syncQuestionsFromFile(fileName) {
     return;
   }
 
-  const ops = allQuestions.map((q) => ({
+  const preparedQuestions = allQuestions.map(prepareQuestionForInsert);
+  const ops = preparedQuestions.map((q) => ({
     updateOne: {
       filter: {
         course: q.course,
@@ -764,11 +768,12 @@ app.post("/api/import", authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const fileName = req.body?.fileName;
     const { allQuestions, sourceFiles } = loadQuestionsPayload(fileName);
+    const preparedQuestions = allQuestions.map(prepareQuestionForInsert);
 
     let inserted = 0;
     let skipped = 0;
 
-    for (let q of allQuestions) {
+    for (let q of preparedQuestions) {
       try {
         await Question.create(q);
         inserted++;
@@ -858,48 +863,294 @@ app.get("/api/metadata", authMiddleware, async (req, res) => {
    GET RANDOM QUESTIONS
 ========================================== */
 
+function parseLimitParam(rawLimit) {
+  let limit = rawLimit;
+  if (Array.isArray(limit)) limit = limit[0];
+  const parsedLimit = Number(limit);
+  const safeLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.floor(parsedLimit) : 10;
+  return Math.min(50, safeLimit);
+}
+
+function parseBooleanParam(value) {
+  if (value === true || value === "true" || value === "1") return true;
+  if (value === false || value === "false" || value === "0") return false;
+  return false;
+}
+
+function isUsableOption(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized !== "" && normalized !== "n/a";
+}
+
+function isUsableQuestion(q) {
+  const usableOptionCount = [
+    q.option_a,
+    q.option_b,
+    q.option_c,
+    q.option_d
+  ].filter(isUsableOption).length;
+  // allow:
+  // - regular MCQ with at least two usable options (e.g., True/False)
+  // - free-response records with no usable options
+  // reject one-option broken records that cause poor rendering.
+  return usableOptionCount === 0 || usableOptionCount >= 2;
+}
+
+function evaluateQuestionQuality(q) {
+  const issues = [];
+  let score = 100;
+
+  const hasQuestion = String(q.question_latex || "").trim().length > 0;
+  if (!hasQuestion) {
+    issues.push("missing_question");
+    score -= 60;
+  }
+
+  const hasCourse = String(q.course || "").trim().length > 0;
+  if (!hasCourse) {
+    issues.push("missing_course");
+    score -= 25;
+  }
+
+  const hasTopic = String(q.topic || "").trim().length > 0;
+  if (!hasTopic) {
+    issues.push("missing_topic");
+    score -= 15;
+  }
+
+  const correct = String(q.correct_option || "").trim().toUpperCase();
+  if (!["A", "B", "C", "D"].includes(correct)) {
+    issues.push("invalid_correct_option");
+    score -= 20;
+  }
+
+  const usableOptionCount = [
+    q.option_a,
+    q.option_b,
+    q.option_c,
+    q.option_d
+  ].filter(isUsableOption).length;
+
+  if (usableOptionCount === 1) {
+    issues.push("only_one_option");
+    score -= 40;
+  }
+
+  if (usableOptionCount > 0 && ["A", "B", "C", "D"].includes(correct)) {
+    const optionMap = {
+      A: q.option_a,
+      B: q.option_b,
+      C: q.option_c,
+      D: q.option_d
+    };
+    if (!isUsableOption(optionMap[correct])) {
+      issues.push("correct_option_missing_text");
+      score -= 25;
+    }
+  }
+
+  if (!String(q.solution_latex || "").trim()) {
+    issues.push("missing_solution");
+    score -= 5;
+  }
+
+  score = Math.max(0, Math.min(100, score));
+  return { qualityScore: score, qualityIssues: issues, needsReview: score < 70 || issues.length > 0 };
+}
+
+function prepareQuestionForInsert(q) {
+  const quality = evaluateQuestionQuality(q);
+  return { ...q, ...quality };
+}
+
+function pickBalancedByTopic(pool, limit, addFn) {
+  const groups = new Map();
+  pool.forEach((q) => {
+    const topic = String(q.topic || "General");
+    if (!groups.has(topic)) groups.set(topic, []);
+    groups.get(topic).push(q);
+  });
+
+  const topics = Array.from(groups.keys());
+  topics.forEach((t) => {
+    const list = groups.get(t);
+    groups.set(t, list.sort(() => Math.random() - 0.5));
+  });
+
+  let cursor = 0;
+  while (addFn.count() < limit && topics.length > 0) {
+    const topic = topics[cursor % topics.length];
+    const list = groups.get(topic) || [];
+    if (!list.length) {
+      groups.delete(topic);
+      const idx = topics.indexOf(topic);
+      if (idx >= 0) topics.splice(idx, 1);
+      if (!topics.length) break;
+      continue;
+    }
+    const q = list.pop();
+    addFn(q);
+    cursor += 1;
+  }
+}
+
+async function pickQuestionsWithFallback({ filter, limit, excludedIds = new Set(), balanceTopics = false }) {
+  const seen = new Set(excludedIds);
+  const selected = [];
+
+  const addQuestion = (q) => {
+    const key = String(q._id || `${q.course}|${q.topic}|${q.question_latex}`);
+    if (seen.has(key)) return;
+    seen.add(key);
+    if (!isUsableQuestion(q)) return;
+    selected.push(q);
+  };
+  addQuestion.count = () => selected.length;
+
+  const pickFromQuery = async (query, balanceTopics) => {
+    if (selected.length >= limit) return;
+    const pool = await Question.find(query).lean();
+    const shuffled = pool.sort(() => Math.random() - 0.5);
+    if (balanceTopics && !query.topic) {
+      pickBalancedByTopic(shuffled, limit, addQuestion);
+    } else {
+      for (const q of shuffled) {
+        addQuestion(q);
+        if (selected.length >= limit) break;
+      }
+    }
+  };
+
+  await pickFromQuery(filter, balanceTopics);
+
+  if (selected.length < limit && filter.difficulty) {
+    const relaxed = { ...filter };
+    delete relaxed.difficulty;
+    await pickFromQuery(relaxed, balanceTopics);
+  }
+
+  if (selected.length < limit && filter.topic) {
+    const relaxed = { ...filter };
+    delete relaxed.topic;
+    delete relaxed.difficulty;
+    await pickFromQuery(relaxed, balanceTopics);
+  }
+
+  if (selected.length < limit && filter.course) {
+    await pickFromQuery({ course: filter.course }, balanceTopics);
+  }
+
+  if (selected.length < limit) {
+    await pickFromQuery({}, balanceTopics);
+  }
+
+  return selected.slice(0, limit);
+}
+
 app.get("/api/questions", authMiddleware, async (req, res) => {
-  let { course, topic, difficulty, limit } = req.query;
-
-  limit = parseInt(limit) || 10;
-
-  // Prevent abuse
-  if (limit > 50) limit = 50;
+  const { course, topic, difficulty } = req.query;
+  const balanceTopics = parseBooleanParam(req.query?.balanceTopics);
+  const limit = parseLimitParam(req.query?.limit);
 
   const filter = {};
   if (course) filter.course = course;
   if (topic) filter.topic = topic;
   if (difficulty) filter.difficulty = difficulty;
 
-  const allQuestions = await Question.find(filter).lean();
-
-  const isUsableOption = (value) => {
-    const normalized = String(value || "").trim().toLowerCase();
-    return normalized !== "" && normalized !== "n/a";
-  };
-
-  // Data cleanup guard: remove records that have no usable options at all.
-  const usableQuestions = allQuestions.filter((q) => {
-    const usableOptionCount = [
-      q.option_a,
-      q.option_b,
-      q.option_c,
-      q.option_d
-    ].filter(isUsableOption).length;
-    // allow:
-    // - regular MCQ with at least two usable options (e.g., True/False)
-    // - free-response records with no usable options
-    // reject one-option broken records that cause poor rendering.
-    return usableOptionCount === 0 || usableOptionCount >= 2;
-  });
-
-  const shuffled = usableQuestions.sort(() => Math.random() - 0.5);
-  const picked = shuffled.slice(0, limit).map((q) => {
+  const picked = await pickQuestionsWithFallback({ filter, limit, balanceTopics });
+  const safePicked = picked.map((q) => {
     const { correct_option, ...safe } = q;
     return safe;
   });
 
-  res.json(picked);
+  res.set("X-Questions-Requested", String(limit));
+  res.set("X-Questions-Returned", String(safePicked.length));
+  res.set("X-Questions-Fallback-Used", String(safePicked.length < limit ? "true" : "false"));
+  res.json(safePicked);
+});
+
+/* ==========================================
+   SMART REVIEW (WRONG ANSWERS PRIORITY)
+========================================== */
+
+app.get("/api/questions/review", authMiddleware, async (req, res) => {
+  const { course, topic, difficulty } = req.query;
+  const balanceTopics = parseBooleanParam(req.query?.balanceTopics);
+  const limit = parseLimitParam(req.query?.limit);
+
+  const questionMatch = {};
+  if (course) questionMatch["question.course"] = course;
+  if (topic) questionMatch["question.topic"] = topic;
+  if (difficulty) questionMatch["question.difficulty"] = difficulty;
+
+  const wrongQuestions = await QuizAttempt.aggregate([
+    { $match: { userId: new mongoose.Types.ObjectId(req.user.id) } },
+    { $unwind: "$answers" },
+    { $match: { "answers.isCorrect": false } },
+    {
+      $group: {
+        _id: "$answers.questionId",
+        lastAttempt: { $max: "$createdAt" },
+        wrongCount: { $sum: 1 }
+      }
+    },
+    { $sort: { lastAttempt: -1, wrongCount: -1 } },
+    { $limit: 200 },
+    {
+      $lookup: {
+        from: "questions",
+        localField: "_id",
+        foreignField: "_id",
+        as: "question"
+      }
+    },
+    { $unwind: "$question" },
+    ...(Object.keys(questionMatch).length ? [{ $match: questionMatch }] : []),
+    {
+      $project: {
+        question: 1,
+        wrongCount: 1,
+        lastAttempt: 1
+      }
+    }
+  ]);
+
+  const picked = [];
+  const excluded = new Set();
+
+  for (const row of wrongQuestions) {
+    const q = row.question;
+    const key = String(q._id || `${q.course}|${q.topic}|${q.question_latex}`);
+    if (excluded.has(key)) continue;
+    if (!isUsableQuestion(q)) continue;
+    excluded.add(key);
+    picked.push(q);
+    if (picked.length >= limit) break;
+  }
+
+  if (picked.length < limit) {
+    const filter = {};
+    if (course) filter.course = course;
+    if (topic) filter.topic = topic;
+    if (difficulty) filter.difficulty = difficulty;
+    const topUp = await pickQuestionsWithFallback({
+      filter,
+      limit: limit - picked.length,
+      excludedIds: excluded,
+      balanceTopics
+    });
+    picked.push(...topUp);
+  }
+
+  const safePicked = picked.slice(0, limit).map((q) => {
+    const { correct_option, ...safe } = q;
+    return safe;
+  });
+
+  res.set("X-Questions-Requested", String(limit));
+  res.set("X-Questions-Returned", String(safePicked.length));
+  res.set("X-Questions-Smart-Review-Used", "true");
+  res.json(safePicked);
 });
 
 function normalizeComparableText(value) {
@@ -1113,21 +1364,126 @@ app.get("/api/admin/attempts",
   });
 
 /* ==========================================
+   ADMIN: QUESTION QUALITY REVIEW
+========================================== */
+
+app.get("/api/admin/questions/review",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { page, limit, minScore, course, topic } = req.query || {};
+      const safePage = parsePositiveInt(page, 1);
+      const safeLimit = parsePositiveInt(limit, 25, 200);
+      const scoreThreshold = Number.isFinite(Number(minScore)) ? Number(minScore) : 70;
+      const skip = (safePage - 1) * safeLimit;
+
+      const filter = {
+        $or: [
+          { needsReview: true },
+          { qualityScore: { $lte: scoreThreshold } },
+          { qualityIssues: { $exists: true, $ne: [] } }
+        ]
+      };
+      if (course) filter.course = course;
+      if (topic) filter.topic = topic;
+
+      const [items, total] = await Promise.all([
+        Question.find(filter).sort({ qualityScore: 1 }).skip(skip).limit(safeLimit).lean(),
+        Question.countDocuments(filter)
+      ]);
+
+      return res.json({
+        items,
+        pagination: {
+          page: safePage,
+          limit: safeLimit,
+          total,
+          totalPages: Math.max(1, Math.ceil(total / safeLimit))
+        }
+      });
+    } catch (error) {
+      console.error("admin questions review error:", error);
+      return res.status(500).json({ message: "Failed to fetch question review queue" });
+    }
+  });
+
+app.post("/api/admin/questions/quality-scan",
+  authMiddleware,
+  adminMiddleware,
+  async (req, res) => {
+    try {
+      const { course, topic, limit } = req.body || {};
+      const safeLimit = parsePositiveInt(limit, 500, 2000);
+
+      const filter = {};
+      if (course) filter.course = course;
+      if (topic) filter.topic = topic;
+
+      const targets = await Question.find(filter).limit(safeLimit).lean();
+      let updated = 0;
+
+      for (const q of targets) {
+        const quality = evaluateQuestionQuality(q);
+        await Question.updateOne(
+          { _id: q._id },
+          { $set: quality }
+        );
+        updated += 1;
+      }
+
+      return res.json({ updated, scanned: targets.length });
+    } catch (error) {
+      console.error("admin quality scan error:", error);
+      return res.status(500).json({ message: "Failed to scan question quality" });
+    }
+  });
+
+/* ==========================================
    LEADERBOARD (TOP 10 BY AVG SCORE)
 ========================================== */
 
+function getWeeklyWindowUtc(now = new Date()) {
+  const todayUtc = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate()
+  ));
+  const day = todayUtc.getUTCDay(); // 0 (Sun) - 6 (Sat)
+  const diffToMonday = (day + 6) % 7;
+  const start = new Date(todayUtc);
+  start.setUTCDate(todayUtc.getUTCDate() - diffToMonday);
+  start.setUTCHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setUTCDate(start.getUTCDate() + 7);
+  return { start, end };
+}
+
 app.get("/api/leaderboard", async (req, res) => {
-  // aggregate average percentages per user and pull username for display
-  const leaderboard = await QuizAttempt.aggregate([
+  const season = String(req.query?.season || "all").toLowerCase();
+  let match = {};
+  let windowStart = null;
+  let windowEnd = null;
+
+  if (season === "weekly") {
+    const window = getWeeklyWindowUtc();
+    windowStart = window.start;
+    windowEnd = window.end;
+    match = { createdAt: { $gte: windowStart, $lt: windowEnd } };
+  }
+
+  const pipeline = [];
+  if (Object.keys(match).length) pipeline.push({ $match: match });
+  pipeline.push(
     {
       $group: {
         _id: "$userId",
-        avgScore: { $avg: "$percentage" }
+        avgScore: { $avg: "$percentage" },
+        attempts: { $sum: 1 }
       }
     },
-    { $sort: { avgScore: -1 } },
+    { $sort: { avgScore: -1, attempts: -1 } },
     { $limit: 10 },
-    // lookup user document to get username
     {
       $lookup: {
         from: "users",
@@ -1140,12 +1496,30 @@ app.get("/api/leaderboard", async (req, res) => {
     {
       $project: {
         avgScore: 1,
+        attempts: 1,
         username: "$user.username"
       }
     }
-  ]);
+  );
 
-  res.json(leaderboard);
+  const leaderboard = await QuizAttempt.aggregate(pipeline);
+  const withBadges = leaderboard.map((entry, index) => {
+    let badge = "";
+    if (index === 0) badge = "gold";
+    if (index === 1) badge = "silver";
+    if (index === 2) badge = "bronze";
+    return { ...entry, rank: index + 1, badge };
+  });
+
+  if (windowStart && windowEnd) {
+    res.set("X-Leaderboard-Season", "weekly");
+    res.set("X-Leaderboard-Start", windowStart.toISOString());
+    res.set("X-Leaderboard-End", windowEnd.toISOString());
+  } else {
+    res.set("X-Leaderboard-Season", "all");
+  }
+
+  res.json(withBadges);
 });
 
 app.get("/api/health", (req, res) => {
