@@ -1,20 +1,20 @@
-# QuickTest Backend
+﻿# QuickTest Backend
 
-Express + MongoDB backend for quiz delivery, scoring, leaderboard, and PDF upload/review workflows.
+Express + MongoDB backend for quiz delivery, scoring, leaderboard, and upload moderation.
 
 ## Stack
 - Node.js (CommonJS)
-- Express 5
+- Express
 - MongoDB + Mongoose
 - JWT auth
 - bcrypt password hashing
 - Multer memory upload middleware
-- Cloudinary raw file upload API
+- Cloudinary upload API
 
 ## Project Files
-- `app.js`: Entire server, models, middleware, and routes
-- `question-banks/`: Folder containing per-course JSON files (one file per bank)
-- `.env`: Runtime secrets/config
+- `app.js`: Server, models, middleware, and routes
+- `question-banks/`: Per-course JSON files (one file per bank)
+- `.env`: Runtime config
 
 ## Environment Variables
 Required:
@@ -30,23 +30,6 @@ Cloudinary (choose one approach):
   - `CLOUDINARY_API_KEY`
   - `CLOUDINARY_API_SECRET`
 
-## Boot Flow (`app.js`)
-1. Loads `.env` with `dotenv`.
-2. Sets DNS resolvers (`8.8.8.8`, `1.1.1.1`).
-3. Creates Express app and enables JSON body parsing + CORS.
-4. Serves `/uploads` static folder.
-5. Adds fallback `/uploads/*requestedPath` route:
-   - If local file exists in `uploads/`, serves it.
-   - Else checks `PdfUpload` document by `filename` or `cloudinaryPublicId`.
-   - If found, redirects to `fileUrl` (Cloudinary URL).
-   - Else returns `404`.
-6. Parses Cloudinary config from split vars or `CLOUDINARY_URL`.
-7. Connects Mongoose to `MONGO_URI`.
-8. Registers schemas/models.
-9. Registers auth/admin middleware.
-10. Registers API routes.
-11. Starts server with `app.listen(PORT)`.
-
 ## Data Models
 ### User
 - `username` (unique, required)
@@ -57,6 +40,7 @@ Cloudinary (choose one approach):
 ### Question
 - `course`, `topic`, `question_latex`, `correct_option`, `difficulty` required
 - options A-D and `solution_latex` optional
+- `qualityScore`, `qualityIssues[]`, `needsReview`
 - timestamps
 - unique index on `{ course, topic, question_latex }` to prevent duplicates
 
@@ -92,13 +76,12 @@ Cloudinary (choose one approach):
 - Requires `isAdmin === true`
 - Returns `403` if not admin
 
-## Cloudinary Upload Internals
-`uploadPdfToCloudinary(fileBuffer, originalname)`:
-1. Builds normalized file name and unique `public_id`.
-2. Builds Cloudinary signed payload (`folder`, `public_id`, `timestamp`).
-3. Creates SHA1 signature using API secret.
-4. Sends multipart request to `https://api.cloudinary.com/v1_1/<cloud>/raw/upload`.
-5. Returns Cloudinary JSON or throws on failed response.
+## Question Bank Import
+- Default import reads every `.json` file in `question-banks/`.
+- Optional body: `{ "fileName": "CHM_101_General_Chemistry.json" }` to import one file.
+- Supports array JSON or object-of-arrays format.
+- Duplicates skipped due to the unique index.
+- Each imported question is scored for quality and flagged if needed.
 
 ## API Reference
 
@@ -107,12 +90,13 @@ Cloudinary (choose one approach):
 - Local file or Cloudinary redirect fallback.
 - Responses: `200` (local), `302` (redirect), `404`.
 
-#### `GET /api/leaderboard`
-- Top 10 users by average percentage.
-- Uses Mongo aggregation + user lookup.
-
 #### `GET /api/health`
 - Lightweight health probe for uptime/deployment checks.
+
+#### `GET /api/leaderboard`
+- Default: all-time top 10 by average percentage.
+- Query: `season=weekly` for weekly reset.
+- Response includes `rank` and `badge` (gold/silver/bronze for top 3).
 
 ### Auth
 #### `POST /api/register`
@@ -142,22 +126,15 @@ Errors: `400` invalid credentials.
 
 ### Questions/Quiz
 #### `POST /api/import` (admin)
-- Imports all JSON files from `question-banks/` by default.
-- Optional body: `{ "fileName": "CHM_101_General_Chemistry.json" }` to import one file.
-- Supports array JSON and object-of-arrays format.
-- Inserts questions; duplicates are skipped.
+Imports all JSON files from `question-banks/` by default.
 Response:
 ```json
 { "inserted": 0, "skipped": 0, "sourceFiles": ["..."] }
 ```
 
 #### `GET /api/metadata` (auth)
-Returns distinct:
-- `courses`
-- `topics`
-- `topicsByCourse`
-- `difficulties`
-- `courseTitles` map (if present in imported data)
+Returns:
+- `courses`, `topics`, `topicsByCourse`, `difficulties`, `courseTitles`
 
 #### `GET /api/questions` (auth)
 Query params:
@@ -165,9 +142,19 @@ Query params:
 - `topic`
 - `difficulty`
 - `limit` (default `10`, max `50`)
+- `balanceTopics=true` (optional)
+
 Behavior:
-- Random samples with `$sample`.
+- Random selection with dedupe and cleanup.
+- If a filter has too few questions, the backend tops up by relaxing filters
+  until the requested count is met.
 - Excludes `correct_option` from response.
+
+#### `GET /api/questions/review` (auth)
+Smart Review mode.
+- Prioritizes questions you previously missed.
+- Supports the same query params as `/api/questions` (including `balanceTopics`).
+- Tops up with regular questions if not enough wrong answers exist.
 
 #### `POST /api/submit` (auth)
 Body:
@@ -184,101 +171,30 @@ Behavior:
 - Deduplicates answers by `questionId`.
 - Computes score and percentage.
 - Stores detailed attempt.
-- If request body omits `course`/`topic`, backend infers them from submitted
-  question IDs so history entries stay labeled correctly.
+- If request body omits `course`/`topic`, backend infers them from submitted IDs.
 Response includes `total`, `score`, `percentage`, `detailedAnswers`.
 
 #### `GET /api/my-attempts` (auth)
 - Without query params: returns array of attempts (backward-compatible).
 - With query params (`page`, `limit`, `course`, `topic`): returns
   `{ attempts, pagination }`.
-- For older records missing `course/topic`, response is enriched from linked
-  question metadata (falls back to `General` / `Mixed Topics`).
 
-#### `GET /api/admin/attempts` (admin)
-- Admin history listing with optional query params:
-  - `page`, `limit`
-  - `course`, `topic`
-  - `username` (case-insensitive partial match)
-- Returns:
-```json
-{
-  "attempts": [],
-  "pagination": { "page": 1, "limit": 25, "total": 0, "totalPages": 1 }
-}
-```
+### Admin: Question Quality
+#### `GET /api/admin/questions/review`
+- Returns low-quality questions for review.
+- Query: `page`, `limit`, `minScore`, `course`, `topic`.
 
-### File Workflow (PDF + Images)
-#### `POST /api/upload-pdf` or `POST /api/upload-file` (auth)
-- Multipart form field: `file`
-- Allowed mime types: `application/pdf`, `image/jpeg`, `image/png`, `image/webp`, `image/gif`
-- Requires Cloudinary config
-- Uploads file to Cloudinary and saves DB record as `pending`
-Response:
-```json
-{
-  "message": "File uploaded and pending review",
-  "url": "https://...",
-  "mimeType": "application/pdf",
-  "resourceType": "image"
-}
-```
+#### `POST /api/admin/questions/quality-scan`
+- Recomputes `qualityScore`, `qualityIssues`, `needsReview` on existing questions.
+- Body supports `course`, `topic`, `limit`.
 
-#### `GET /api/my-uploads` (auth)
-- User sees their own uploaded PDFs.
+### Admin: Attempts, Uploads, Stats
+- `GET /api/admin/attempts`
+- `GET /api/admin/uploads`
+- `PATCH /api/admin/uploads/:id`
+- `DELETE /api/admin/uploads/:id`
+- `GET /api/admin/stats`
 
-#### `GET /api/admin/uploads` (admin)
-- Admin sees all uploads with uploader username.
-
-#### `PATCH /api/admin/uploads/:id` (admin)
-Body:
-```json
-{ "status": "approved" }
-```
-- Allowed values: `approved`, `rejected`
-
-#### `GET /api/admin/stats` (admin)
-Returns totals:
-- users
-- questions
-- attempts
-- uploads
-
-## Local Run
-```bash
-npm install
-node app.js
-```
-
-## Pre-Push Verification (Executed)
-Date tested: 2026-03-03
-
-### Passed
-- Server boot + DB connection
-- `POST /api/register` (user)
-- `POST /api/login` (user)
-- Unauthorized guard on `GET /api/questions` (`401`)
-- `GET /api/metadata`
-- `GET /api/questions` (authorized)
-- `POST /api/submit`
-- `GET /api/my-attempts`
-- `GET /api/leaderboard`
-- `POST /api/upload-pdf`
-- `GET /api/my-uploads`
-- `GET /uploads/<cloudinaryPublicId>` returns `302` redirect
-- Admin endpoints reject non-admin token (`403`)
-
-### Blocked (needs real admin credentials)
-- `POST /api/import` success path
-- `GET /api/admin/uploads` success path
-- `PATCH /api/admin/uploads/:id` success path
-- `GET /api/admin/stats` success path
-
-Reason: an admin already exists in the database, so a new admin cannot be created by design, and existing admin credentials were not available in-session.
-
-## Known Notes
-- Express 5 requires named wildcard route syntax; `/uploads/*requestedPath` is the compatible form.
-- Upload endpoint validates mime type but does not inspect PDF binary signature.
-- `percentage` is stored as a string (because of `toFixed(2)`) though used numerically in leaderboard aggregation.
-- To add a new course bank, create a new `.json` file in `question-banks/`.
-  On next `/api/import` (or startup sync), it will be auto-discovered and imported.
+## Notes
+- Uploads accept PDFs and common image formats.
+- The download route supports local files and Cloudinary-backed uploads.
