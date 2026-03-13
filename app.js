@@ -1476,9 +1476,28 @@ app.get("/api/leaderboard", async (req, res) => {
   if (Object.keys(match).length) pipeline.push({ $match: match });
   pipeline.push(
     {
+      $addFields: {
+        percentageNumber: {
+          $cond: [
+            { $isNumber: "$percentage" },
+            "$percentage",
+            {
+              $toDouble: {
+                $replaceAll: {
+                  input: { $toString: "$percentage" },
+                  find: "%",
+                  replacement: ""
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
       $group: {
         _id: "$userId",
-        avgScore: { $avg: "$percentage" },
+        avgScore: { $avg: "$percentageNumber" },
         attempts: { $sum: 1 }
       }
     },
@@ -1502,24 +1521,29 @@ app.get("/api/leaderboard", async (req, res) => {
     }
   );
 
-  const leaderboard = await QuizAttempt.aggregate(pipeline);
-  const withBadges = leaderboard.map((entry, index) => {
-    let badge = "";
-    if (index === 0) badge = "gold";
-    if (index === 1) badge = "silver";
-    if (index === 2) badge = "bronze";
-    return { ...entry, rank: index + 1, badge };
-  });
+  try {
+    const leaderboard = await QuizAttempt.aggregate(pipeline);
+    const withBadges = leaderboard.map((entry, index) => {
+      let badge = "";
+      if (index === 0) badge = "gold";
+      if (index === 1) badge = "silver";
+      if (index === 2) badge = "bronze";
+      return { ...entry, rank: index + 1, badge };
+    });
 
-  if (windowStart && windowEnd) {
-    res.set("X-Leaderboard-Season", "weekly");
-    res.set("X-Leaderboard-Start", windowStart.toISOString());
-    res.set("X-Leaderboard-End", windowEnd.toISOString());
-  } else {
-    res.set("X-Leaderboard-Season", "all");
+    if (windowStart && windowEnd) {
+      res.set("X-Leaderboard-Season", "weekly");
+      res.set("X-Leaderboard-Start", windowStart.toISOString());
+      res.set("X-Leaderboard-End", windowEnd.toISOString());
+    } else {
+      res.set("X-Leaderboard-Season", "all");
+    }
+
+    res.json(withBadges);
+  } catch (error) {
+    console.error("leaderboard error:", error);
+    res.status(500).json({ message: "Internal Server Error" });
   }
-
-  res.json(withBadges);
 });
 
 app.get("/api/health", (req, res) => {
