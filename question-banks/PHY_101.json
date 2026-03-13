@@ -9,7 +9,7 @@
     "option_d": "$[MLT^{-2}]$",
     "correct_option": "A",
     "difficulty": "hard",
-    "solution_latex": "From $F = \\frac{Gm_1m_2}{r^2}$, $G = \\frac{Fr^2}{m^2}$. Dimensions: $\\frac{[MLT^{-2},L^2]}{[M^2]} = [M^{-1}L^3T^{-2}]$"
+    "solution_latex": "From $F = \\frac{Gm_1m_2}{r^2}$, $G = \\frac{Fr^2}{m^2}$. Dimensions: $\\frac{[MLT^{-2}][L^2]}{[M^2]} = [M^{-1}L^3T^{-2}]$"
   },
   {
     "course": "PHY 101",
@@ -285,7 +285,7 @@
     "option_d": "$[MLT^{-1}]$",
     "correct_option": "A",
     "difficulty": "hard",
-    "solution_latex": "$F=ma \\implies [M,LT^{-2}] = [MLT^{-2}]$."
+    "solution_latex": "$F=ma \\implies [M][LT^{-2}] = [MLT^{-2}]$."
   },
   {
     "course": "PHY 101",
