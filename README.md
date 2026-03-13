@@ -1,20 +1,20 @@
-﻿# QuickTest Backend
+# QuickTest Backend
 
-Express + MongoDB backend for quiz delivery, scoring, leaderboard, and upload moderation.
+QuickTest is a quiz platform backend that powers course discovery, quiz generation, scoring, history, leaderboard, and file uploads. It is designed for an MVP workflow where questions are maintained in JSON banks and imported into MongoDB.
 
-## Stack
-- Node.js (CommonJS)
-- Express
-- MongoDB + Mongoose
-- JWT auth
-- bcrypt password hashing
-- Multer memory upload middleware
-- Cloudinary upload API
+## Architecture Overview
+The backend is a single Express app with MongoDB for persistence. Requests are authenticated with JWT, and all quiz-related endpoints require a valid token. Admin-only endpoints handle question import, quality review, stats, and uploads moderation.
 
-## Project Files
-- `app.js`: Server, models, middleware, and routes
-- `question-banks/`: Per-course JSON files (one file per bank)
-- `.env`: Runtime config
+High-level flow:
+- Questions live in `question-banks/` JSON files.
+- Admin calls `/api/import` to insert them into MongoDB.
+- Users fetch metadata and randomized questions, submit answers, and view results/history.
+
+## Folder Structure
+- `app.js`: Server, models, middleware, and all routes
+- `question-banks/`: Per-course JSON banks
+- `uploads/`: Local upload fallback directory
+- `.env`: Runtime configuration
 
 ## Environment Variables
 Required:
@@ -30,6 +30,35 @@ Cloudinary (choose one approach):
   - `CLOUDINARY_API_KEY`
   - `CLOUDINARY_API_SECRET`
 
+## Running Locally
+```bash
+npm install
+node app.js
+```
+
+## Question Banks
+Each file in `question-banks/` is a JSON array of question objects:
+```json
+[
+  {
+    "course": "CST 101",
+    "topic": "Computer Overview",
+    "question_latex": "What is a computer?",
+    "option_a": "...",
+    "option_b": "...",
+    "option_c": "...",
+    "option_d": "...",
+    "correct_option": "B",
+    "difficulty": "easy",
+    "solution_latex": "..."
+  }
+]
+```
+Notes:
+- `course`, `topic`, `question_latex`, `correct_option`, `difficulty` are required.
+- The unique index is `{ course, topic, question_latex }`, so duplicates are skipped.
+- LaTeX is supported in `question_latex` and `solution_latex`.
+
 ## Data Models
 ### User
 - `username` (unique, required)
@@ -38,163 +67,79 @@ Cloudinary (choose one approach):
 - timestamps
 
 ### Question
-- `course`, `topic`, `question_latex`, `correct_option`, `difficulty` required
-- options A-D and `solution_latex` optional
-- `qualityScore`, `qualityIssues[]`, `needsReview`
+- Required: `course`, `topic`, `question_latex`, `correct_option`, `difficulty`
+- Optional: `option_a` - `option_d`, `solution_latex`
+- Quality fields: `qualityScore`, `qualityIssues[]`, `needsReview`
 - timestamps
-- unique index on `{ course, topic, question_latex }` to prevent duplicates
 
 ### QuizAttempt
-- `userId`
-- `score`, `total`, `percentage`
-- `course`, `topic`
-- `answers[]` containing:
-  - `questionId`
-  - `selectedOption`
-  - `correctOption`
-  - `isCorrect`
+- `userId`, `score`, `total`, `percentage`, `course`, `topic`
+- `answers[]` with `questionId`, `selectedOption`, `correctOption`, `isCorrect`
 - timestamps
 
 ### PdfUpload
-- `userId`
-- `filename`
-- `originalname`
-- `fileUrl`
-- `cloudinaryPublicId`
-- `status`: `pending | approved | rejected` (default `pending`)
+- `userId`, `filename`, `originalname`, `fileUrl`, `cloudinaryPublicId`
+- `status`: `pending | approved | rejected`
 - timestamps
 
-## Middleware
-### `authMiddleware`
-- Reads bearer token from `Authorization: Bearer <token>`
-- Verifies with `JWT_SECRET`
-- Sets `req.user`
-- Returns `401` for missing/invalid token
+## Core Features
+### Question Generation
+- `/api/questions` returns random questions with dedupe.
+- If a filter has too few questions, it tops up by relaxing filters until the count is met.
+- `balanceTopics=true` spreads questions across topics when no topic is specified.
 
-### `adminMiddleware`
-- Loads requesting user from DB using `req.user.id`
-- Requires `isAdmin === true`
-- Returns `403` if not admin
+### Smart Review
+- `/api/questions/review` prioritizes questions the user missed before.
+- If there are not enough wrong questions, it tops up with regular ones.
 
-## Question Bank Import
-- Default import reads every `.json` file in `question-banks/`.
-- Optional body: `{ "fileName": "CHM_101_General_Chemistry.json" }` to import one file.
-- Supports array JSON or object-of-arrays format.
-- Duplicates skipped due to the unique index.
-- Each imported question is scored for quality and flagged if needed.
+### Scoring
+- `/api/submit` deduplicates answers and computes score and percentage.
+- Returns `detailedAnswers` for rich client-side results views.
+
+### Leaderboard
+- `/api/leaderboard` returns top 10 by average percentage.
+- `season=weekly` resets to the current week and adds `rank` + `badge`.
+
+### Question Quality Review
+- `/api/admin/questions/review` lists low-quality questions.
+- `/api/admin/questions/quality-scan` recalculates quality metrics.
+
+### Uploads
+- Users can upload PDFs and images.
+- `/uploads/*` serves local files or redirects to Cloudinary URLs.
 
 ## API Reference
-
-### Public/General
-#### `GET /uploads/<path>`
-- Local file or Cloudinary redirect fallback.
-- Responses: `200` (local), `302` (redirect), `404`.
-
-#### `GET /api/health`
-- Lightweight health probe for uptime/deployment checks.
-
-#### `GET /api/leaderboard`
-- Default: all-time top 10 by average percentage.
-- Query: `season=weekly` for weekly reset.
-- Response includes `rank` and `badge` (gold/silver/bronze for top 3).
-
 ### Auth
-#### `POST /api/register`
-Body:
-```json
-{ "username": "user1", "password": "secret", "adminSecret": "optional" }
-```
-Behavior:
-- If `adminSecret` provided, must match `ADMIN_SECRET`.
-- Only one admin can ever be created.
-- Hashes password with bcrypt.
-Responses:
-- `200` success
-- `400` missing fields / duplicate username
-- `403` invalid admin secret or admin already exists
+- `POST /api/register`
+- `POST /api/login`
+- `POST /api/forgot-password`
+- `POST /api/reset-password`
 
-#### `POST /api/login`
-Body:
-```json
-{ "username": "user1", "password": "secret" }
-```
-Response:
-```json
-{ "token": "<jwt>", "isAdmin": false }
-```
-Errors: `400` invalid credentials.
+### Questions
+- `POST /api/import` (admin)
+- `GET /api/metadata`
+- `GET /api/questions`
+- `GET /api/questions/review`
+- `POST /api/submit`
+- `GET /api/my-attempts`
 
-### Questions/Quiz
-#### `POST /api/import` (admin)
-Imports all JSON files from `question-banks/` by default.
-Response:
-```json
-{ "inserted": 0, "skipped": 0, "sourceFiles": ["..."] }
-```
-
-#### `GET /api/metadata` (auth)
-Returns:
-- `courses`, `topics`, `topicsByCourse`, `difficulties`, `courseTitles`
-
-#### `GET /api/questions` (auth)
-Query params:
-- `course`
-- `topic`
-- `difficulty`
-- `limit` (default `10`, max `50`)
-- `balanceTopics=true` (optional)
-
-Behavior:
-- Random selection with dedupe and cleanup.
-- If a filter has too few questions, the backend tops up by relaxing filters
-  until the requested count is met.
-- Excludes `correct_option` from response.
-
-#### `GET /api/questions/review` (auth)
-Smart Review mode.
-- Prioritizes questions you previously missed.
-- Supports the same query params as `/api/questions` (including `balanceTopics`).
-- Tops up with regular questions if not enough wrong answers exist.
-
-#### `POST /api/submit` (auth)
-Body:
-```json
-{
-  "course": "mathematics",
-  "topic": "algebra",
-  "answers": [
-    { "questionId": "...", "selectedOption": "A" }
-  ]
-}
-```
-Behavior:
-- Deduplicates answers by `questionId`.
-- Computes score and percentage.
-- Stores detailed attempt.
-- If request body omits `course`/`topic`, backend infers them from submitted IDs.
-Response includes `total`, `score`, `percentage`, `detailedAnswers`.
-
-#### `GET /api/my-attempts` (auth)
-- Without query params: returns array of attempts (backward-compatible).
-- With query params (`page`, `limit`, `course`, `topic`): returns
-  `{ attempts, pagination }`.
-
-### Admin: Question Quality
-#### `GET /api/admin/questions/review`
-- Returns low-quality questions for review.
-- Query: `page`, `limit`, `minScore`, `course`, `topic`.
-
-#### `POST /api/admin/questions/quality-scan`
-- Recomputes `qualityScore`, `qualityIssues`, `needsReview` on existing questions.
-- Body supports `course`, `topic`, `limit`.
-
-### Admin: Attempts, Uploads, Stats
+### Admin
 - `GET /api/admin/attempts`
+- `GET /api/admin/questions/review`
+- `POST /api/admin/questions/quality-scan`
 - `GET /api/admin/uploads`
 - `PATCH /api/admin/uploads/:id`
 - `DELETE /api/admin/uploads/:id`
 - `GET /api/admin/stats`
 
-## Notes
-- Uploads accept PDFs and common image formats.
-- The download route supports local files and Cloudinary-backed uploads.
+### Misc
+- `GET /api/leaderboard`
+- `GET /api/health`
+
+## Troubleshooting
+- If `/api/import` inserts `0`, the questions are likely duplicates already in MongoDB.
+- If `metadata` is empty, run admin sync to import question banks.
+- If uploads return `404`, check Cloudinary credentials and `uploads/` fallback.
+
+## Deployment Notes
+Make sure the same `.env` values are set in your host (Vercel or other). The backend relies on MongoDB being reachable at all times for metadata, quizzes, and leaderboard.
