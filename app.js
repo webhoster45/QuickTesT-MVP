@@ -1057,7 +1057,19 @@ app.get("/api/questions", authMiddleware, async (req, res) => {
   if (topic) filter.topic = topic;
   if (difficulty) filter.difficulty = difficulty;
 
-  const picked = await pickQuestionsWithFallback({ filter, limit, balanceTopics });
+  let effectiveBalanceTopics = balanceTopics;
+  if (!topic && course && !balanceTopics) {
+    try {
+      const topicsForCourse = await Question.distinct('topic', { course });
+      if (Array.isArray(topicsForCourse) && topicsForCourse.length > 1) {
+        effectiveBalanceTopics = true;
+      }
+    } catch (error) {
+      console.error('auto-balance topics check failed:', error);
+    }
+  }
+
+  const picked = await pickQuestionsWithFallback({ filter, limit, balanceTopics: effectiveBalanceTopics });
   const safePicked = picked.map((q) => {
     const { correct_option, ...safe } = q;
     return safe;
