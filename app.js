@@ -269,9 +269,14 @@ async function deleteFileFromCloudinary(publicId, resourceType = "image") {
   return data;
 }
 
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log("MongoDB Connected"))
-  .catch(err => console.error("MongoDB Error:", err));
+const mongoUri = process.env.MONGO_URI || process.env.MONGODB_URI || process.env.MONGODB_URL2_MONGODB_URI;
+if (!mongoUri) {
+  console.error("MongoDB URI not configured. Set MONGO_URI or MONGODB_URL2_MONGODB_URI.");
+} else {
+  mongoose.connect(mongoUri)
+    .then(() => console.log("MongoDB Connected"))
+    .catch(err => console.error("MongoDB Error:", err));
+}
 
 /* ==========================================
    SCHEMAS
