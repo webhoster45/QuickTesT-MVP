@@ -27,6 +27,62 @@ app.use(cors('*'))
 // serve uploaded files so frontend can download them
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
+const mongoUri = process.env.MONGO_URI || process.env.MONGODB_URI || process.env.MONGODB_URL2_MONGODB_URI || process.env.MONGODB_URL;
+
+mongoose.set("bufferCommands", false);
+
+async function ensureDatabaseConnection() {
+  if (mongoose.connection.readyState === 1) return true;
+
+  if (mongoose.connection.readyState === 2) {
+    try {
+      await mongoose.connection.asPromise();
+      return mongoose.connection.readyState === 1;
+    } catch (error) {
+      console.error("MongoDB connection wait failed:", error);
+      return false;
+    }
+  }
+
+  try {
+    await mongoose.connect(mongoUri, {
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS: 20000,
+      family: 4
+    });
+    return true;
+  } catch (error) {
+    console.error("MongoDB Error:", error);
+    return false;
+  }
+}
+
+ensureDatabaseConnection().then((connected) => {
+  if (connected) {
+    console.log("MongoDB Connected");
+  } else {
+    console.warn("MongoDB unavailable; requests will return 503 until the connection is restored.");
+  }
+});
+
+app.use(async (req, res, next) => {
+  if (req.path.startsWith('/uploads') || req.path === '/api/health') {
+    return next();
+  }
+
+  if (req.path.startsWith('/api/')) {
+    const connected = await ensureDatabaseConnection();
+    if (!connected) {
+      return res.status(503).json({
+        message: "Database unavailable",
+        error: "MongoDB connection failed"
+      });
+    }
+  }
+
+  next();
+});
+
 // explicit download route (fallback for some environments)
 app.get('/uploads/*requestedPath', async (req, res) => {
   const requestedParam = req.params.requestedPath;
@@ -267,15 +323,6 @@ async function deleteFileFromCloudinary(publicId, resourceType = "image") {
   }
 
   return data;
-}
-
-const mongoUri = process.env.MONGO_URI || process.env.MONGODB_URI || process.env.MONGODB_URL2_MONGODB_URI;
-if (!mongoUri) {
-  console.error("MongoDB URI not configured. Set MONGO_URI or MONGODB_URL2_MONGODB_URI.");
-} else {
-  mongoose.connect(mongoUri)
-    .then(() => console.log("MongoDB Connected"))
-    .catch(err => console.error("MongoDB Error:", err));
 }
 
 /* ==========================================
