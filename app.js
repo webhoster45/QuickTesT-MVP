@@ -866,8 +866,29 @@ app.get("/api/metadata", authMiddleware, async (req, res) => {
         ])
       ]);
 
+    const normalizeCourseValue = (value) => {
+      const raw = String(value || "").trim();
+      if (!raw) return raw;
+
+      const normalized = raw
+        .replace(/\s+/g, " ")
+        .replace(/\(\s+/g, "(")
+        .replace(/\s+\)/g, ")")
+        .trim();
+
+      if (/^(Computer Science|CSC 101)$/i.test(normalized)) return "CST 101";
+      if (/^CST 101 \(Health Science\)$/i.test(normalized)) return "CST 101 (Health Sciences)";
+      if (/^Computer Organization and Architecture(?:\s*\(\s*200L\s*\))?$/i.test(normalized)) {
+        return "Computer Organization and Architecture (200L)";
+      }
+      if (/^System Analysis(?:\s*\(\s*200L\s*\))?$/i.test(normalized)) {
+        return "System Analysis (200L)";
+      }
+      return normalized;
+    };
+
     const courses = coursesResult.status === "fulfilled"
-      ? coursesResult.value.filter(Boolean).map((v) => String(v))
+      ? Array.from(new Set(coursesResult.value.filter(Boolean).map(normalizeCourseValue).filter(Boolean)))
       : [];
     const topics = topicsResult.status === "fulfilled"
       ? topicsResult.value.filter(Boolean).map((v) => String(v))
